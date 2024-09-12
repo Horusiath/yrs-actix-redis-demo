@@ -1,17 +1,20 @@
+pub mod broadcast;
+pub mod error;
+
 use actix_web::web::Data;
 use actix_web::{rt, web, App, Error, HttpRequest, HttpResponse, HttpServer};
 use actix_ws::AggregatedMessage;
-use anyhow::Result;
 use futures::StreamExt;
+use redis::Client;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 #[actix::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), actix_web::Error> {
     const PORT: u16 = 8080;
     env_logger::init();
-    let redis = redis::Client::open("redis://localhost:6379")?;
+    let redis = redis::Client::open("redis://localhost:6379").unwrap();
 
-    tracing::info!("Starting server on port {}", PORT);
+    tracing::info!("Starting web server on port {}", PORT);
     HttpServer::new(move || {
         App::new()
             .app_data(Data::new(redis.clone()))
@@ -23,7 +26,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn echo(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
+async fn echo(
+    req: HttpRequest,
+    stream: web::Payload,
+    redis: Data<Client>,
+) -> Result<HttpResponse, Error> {
     let (res, mut session, stream) = actix_ws::handle(&req, stream)?;
 
     let mut stream = stream

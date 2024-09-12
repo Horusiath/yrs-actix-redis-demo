@@ -1,6 +1,4 @@
 # Essential services for AppFlowy Cloud
-
-version: "3.7"
 services:
   redis:
     restart: on-failure
