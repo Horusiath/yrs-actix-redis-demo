@@ -1876,6 +1876,7 @@ dependencies = [
  "actix-web",
  "actix-web-actors",
  "actix-ws",
+ "arc-swap",
  "async-trait",
  "bytes",
  "dashmap",

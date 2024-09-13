@@ -6,19 +6,21 @@ use opendal::Operator;
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamId, StreamRangeReply, StreamReadReply};
 use redis::{AsyncCommands, FromRedisValue};
+use std::collections::HashSet;
+use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::ReusableBoxFuture;
 use uuid::Uuid;
+use yrs::Doc;
 
 pub type SubscriberId = Uuid;
+pub type MessageId = Arc<str>;
 
+#[derive(Debug, Clone)]
 pub struct BroadcastGroup {
-    redis_conn: Arc<Mutex<ConnectionManager>>,
-    s3: Operator,
-    stream_id: Arc<str>,
-    msg_handler: JoinHandle<()>,
-    subscribers: Arc<DashMap<SubscriberId, Subscriber>>,
+    state: Arc<BroadcastState>,
 }
 
 impl BroadcastGroup {
@@ -26,54 +28,42 @@ impl BroadcastGroup {
         stream_id: S,
         conn: ConnectionManager,
         operator: Operator,
+        options: Options,
     ) -> Self {
         let stream_id = stream_id.into();
-        let subscribers = Arc::new(DashMap::new());
-        let msg_handler = tokio::spawn(Self::handle_messages(
-            conn.clone(),
-            operator.clone(),
-            stream_id.clone(),
-            Arc::downgrade(&subscribers),
-        ));
-        let conn = Arc::new(Mutex::new(conn));
-        Self {
+        let conn = Mutex::new(conn);
+        let state = Arc::new(BroadcastState {
+            redis: conn,
             s3: operator,
-            redis_conn: conn,
-            stream_id,
-            msg_handler,
-            subscribers,
-        }
+            stream_id: stream_id.clone(),
+            subscribers: DashMap::new(),
+        });
+        // we can stop task by dropping the broadcast state
+        tokio::spawn(Self::handle_messages(
+            Arc::downgrade(&state),
+            options.snapshot_threshold,
+        ));
+        Self { state }
+    }
+
+    #[inline]
+    pub async fn publish(&self, sender: &SubscriberId, msg: Bytes) -> Result<String, Error> {
+        self.state.publish(sender, msg).await
+    }
+
+    /// Loads document state.
+    #[inline]
+    pub async fn load(&self) -> Result<Doc, Error> {
+        self.state.load().await
     }
 
     /// Drops all messages in the stream before the given message ID.
-    pub async fn cutoff(&self, msg_id: &str) -> Result<(), Error> {
-        let mut conn = self.redis_conn.lock().await;
-        let value = conn.xrange(self.stream_id.as_ref(), "-", msg_id).await?;
-        let value = StreamRangeReply::from_owned_redis_value(value)?;
-        let msg_ids: Vec<_> = value
-            .ids
-            .into_iter()
-            .map(|stream_id| stream_id.id)
-            .collect();
-        conn.xdel(self.stream_id.as_ref(), &msg_ids).await?;
-        Ok(())
+    #[inline]
+    pub async fn cutoff(&self, msg_id: &str) -> Result<usize, Error> {
+        self.state.cutoff(msg_id).await
     }
 
-    pub async fn publish(&self, sender: &SubscriberId, msg: Bytes) -> Result<String, Error> {
-        tracing::trace!("Publishing message as `{}`: {:?}", sender, msg);
-        let mut conn = self.redis_conn.lock().await;
-        let sender: &[u8] = sender.as_bytes();
-        let msg: &[u8] = msg.as_ref();
-        let message_id = conn
-            .xadd(
-                self.stream_id.as_ref(),
-                "*",
-                &[("sender", sender), ("msg", msg)],
-            )
-            .await?;
-        Ok(String::from_owned_redis_value(message_id)?)
-    }
-
+    /// Accepts a new subscriber.
     pub fn subscribe<Sink, Stream>(
         &self,
         subscriber_id: SubscriberId,
@@ -83,11 +73,9 @@ impl BroadcastGroup {
         Sink: futures::Sink<Message, Error = Error> + Unpin + Send + Sync + 'static,
         Stream: futures::Stream<Item = Result<Bytes, Error>> + Unpin + Send + Sync + 'static,
     {
-        let conn = self.redis_conn.clone();
-        let stream_id = self.stream_id.clone();
-        let sender = subscriber_id.clone();
+        let state = Arc::downgrade(&self.state);
         let listener = tokio::spawn(async move {
-            if let Err(err) = Subscriber::handle(stream_id, sender, conn, stream).await {
+            if let Err(err) = Subscriber::handle(state, subscriber_id, stream).await {
                 tracing::error!("Error handling subscriber messages: {}", err);
             }
         });
@@ -101,70 +89,74 @@ impl BroadcastGroup {
         };
         tracing::info!(
             "Topic `{}` accepted subscriber `{}`",
-            self.stream_id,
+            self.state.stream_id,
             subscriber_id
         );
-        self.subscribers.insert(subscriber_id, subscriber);
+        self.state.subscribers.insert(subscriber_id, subscriber);
     }
 
-    async fn handle_messages(
-        conn: ConnectionManager,
-        operator: Operator,
-        stream_id: Arc<str>,
-        subscribers: Weak<DashMap<SubscriberId, Subscriber>>,
-    ) {
-        if let Err(err) = Self::handle_messages_err(conn, operator, stream_id, subscribers).await {
-            tracing::error!("Error handling messages: {}", err);
+    async fn handle_messages(state: Weak<BroadcastState>, snapshot_threshold: usize) {
+        if let Err(err) = Self::handle_messages_internal(state, snapshot_threshold).await {
+            tracing::error!("Error while handling messages: {}", err);
         }
     }
 
-    async fn handle_messages_err(
-        mut conn: ConnectionManager,
-        operator: Operator,
-        stream_id: Arc<str>,
-        subscribers: Weak<DashMap<Uuid, Subscriber>>,
+    async fn handle_messages_internal(
+        state: Weak<BroadcastState>,
+        snapshot_threshold: usize,
     ) -> Result<(), Error> {
-        let mut last_id = "0".to_string();
-        let read_options = redis::streams::StreamReadOptions::default().count(100);
+        let mut last_id: MessageId = "0".into();
+        let read_options = redis::streams::StreamReadOptions::default()
+            .count(1000) // up to 1000 messages
+            .block(1000); // block for 1 second
+        let mut conn = if let Some(state) = state.upgrade() {
+            state.redis.lock().await.clone()
+        } else {
+            return Ok(());
+        };
         loop {
-            let subscribers = match subscribers.upgrade() {
-                Some(subscribers) => subscribers,
+            let state = match state.upgrade() {
+                Some(state) => state,
                 None => break,
             };
             let reply: StreamReadReply = conn
-                .xread_options(&[stream_id.as_ref()], &[&last_id], &read_options)
+                .xread_options(
+                    &[state.stream_id.as_ref()],
+                    &[last_id.as_ref()],
+                    &read_options,
+                )
                 .await?;
 
             if !reply.keys.is_empty() {
-                for stream_key in reply.keys {
-                    last_id = stream_key.key;
-                    for data in stream_key.ids {
-                        let msg = Message::try_from(data)?;
-                        let mut dropped_subscribers = Vec::new();
-                        for subscriber in subscribers.iter() {
-                            if subscriber.key() != &msg.sender {
-                                let msg_id = msg.stream_msg_id.clone();
-                                match subscriber.send(msg.clone()).await {
-                                    Ok(_) => {
-                                        tracing::trace!(
-                                            "Topic `{}` sent message `{}` to subscriber `{}`",
-                                            stream_id,
-                                            msg_id,
-                                            subscriber.key(),
-                                        );
-                                    }
-                                    Err(Error::SubscriberDropped(id)) => {
-                                        dropped_subscribers.push(id);
-                                    }
-                                    Err(err) => return Err(err),
+                let mut messages = Message::parse_redis_reply(reply);
+                let mut dropped_subscribers = HashSet::new();
+                for result in messages {
+                    let msg = result?;
+                    last_id = msg.id.clone();
+                    for subscriber in state.subscribers.iter() {
+                        if subscriber.key() != &msg.sender {
+                            let msg_id = msg.id.clone();
+                            match subscriber.send(msg.clone()).await {
+                                Ok(_) => {
+                                    tracing::trace!(
+                                        "Topic `{}` sent message `{}` to subscriber `{}`",
+                                        state.stream_id,
+                                        msg_id,
+                                        subscriber.key(),
+                                    );
                                 }
+                                Err(Error::SubscriberDropped(id)) => {
+                                    dropped_subscribers.insert(id);
+                                }
+                                Err(err) => return Err(err),
                             }
                         }
-                        for id in dropped_subscribers {
-                            tracing::trace!("Topic `{}` dropping subscriber `{}`", stream_id, id);
-                            subscribers.remove(&id);
-                        }
                     }
+                }
+
+                for id in dropped_subscribers {
+                    tracing::trace!("Topic `{}` dropping subscriber `{}`", state.stream_id, id);
+                    state.subscribers.remove(&id);
                 }
             }
         }
@@ -172,10 +164,64 @@ impl BroadcastGroup {
     }
 }
 
-impl Drop for BroadcastGroup {
-    fn drop(&mut self) {
-        self.msg_handler.abort();
+struct BroadcastState {
+    redis: Mutex<ConnectionManager>,
+    s3: Operator,
+    stream_id: Arc<str>,
+    subscribers: DashMap<SubscriberId, Subscriber>,
+}
+
+impl BroadcastState {
+    pub async fn load(&self) -> Result<Doc, Error> {
+        todo!()
     }
+
+    pub async fn publish(&self, sender: &SubscriberId, msg: Bytes) -> Result<String, Error> {
+        tracing::trace!("Publishing message as `{}`: {:?}", sender, msg);
+        let mut conn = self.redis.lock().await;
+        let sender: &[u8] = sender.as_bytes();
+        let msg: &[u8] = msg.as_ref();
+        let message_id = conn
+            .xadd(
+                self.stream_id.as_ref(),
+                "*",
+                &[("sender", sender), ("msg", msg)],
+            )
+            .await?;
+        Ok(String::from_owned_redis_value(message_id)?)
+    }
+
+    pub async fn cutoff(&self, last_msg_id: &str) -> Result<usize, Error> {
+        let mut conn = self.redis.lock().await;
+        let value = conn
+            .xrange(self.stream_id.as_ref(), "-", last_msg_id)
+            .await?;
+        let value = StreamRangeReply::from_owned_redis_value(value)?;
+        let msg_ids: Vec<_> = value
+            .ids
+            .into_iter()
+            .map(|stream_id| stream_id.id)
+            .collect();
+        let count = msg_ids.len();
+        conn.xdel(self.stream_id.as_ref(), &msg_ids).await?;
+        Ok(count)
+    }
+}
+
+impl Debug for BroadcastState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BroadcastState")
+            .field("stream_id", &self.stream_id)
+            .field("subscribers", &self.subscribers)
+            .finish()
+    }
+}
+
+struct SnapshotProgress {
+    threshold: usize,
+    counter: usize,
+    last_msg_id: MessageId,
+    pending: Option<ReusableBoxFuture<'static, Result<Doc, Error>>>,
 }
 
 struct Subscriber {
@@ -196,42 +242,60 @@ impl Subscriber {
     }
 
     async fn handle<Stream>(
-        stream_id: Arc<str>,
+        state: Weak<BroadcastState>,
         subscriber_id: SubscriberId,
-        conn: Arc<Mutex<ConnectionManager>>,
         mut stream: Stream,
     ) -> Result<(), Error>
     where
         Stream: futures::Stream<Item = Result<Bytes, Error>> + Unpin + Send + Sync + 'static,
     {
         while let Some(msg) = stream.next().await {
-            let msg = msg?;
-            let mut conn = conn.lock().await;
-            let sender: &[u8] = subscriber_id.as_bytes();
-            let msg: &[u8] = msg.as_ref();
-            conn.xadd(
-                stream_id.as_ref(),
-                "*",
-                &[("sender", &sender), ("data", &msg)],
-            )
-            .await?;
+            if let Some(state) = state.upgrade() {
+                let msg = msg?;
+                let mut conn = state.redis.lock().await;
+                let sender: &[u8] = subscriber_id.as_bytes();
+                let msg: &[u8] = msg.as_ref();
+                conn.xadd(
+                    state.stream_id.as_ref(),
+                    "*",
+                    &[("sender", &sender), ("data", &msg)],
+                )
+                .await?;
+            } else {
+                break;
+            }
         }
         Ok(())
     }
 }
 
+impl Debug for Subscriber {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscriber").field("id", &self.id).finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
-    pub stream_msg_id: Arc<str>,
+    pub id: MessageId,
     pub sender: Uuid,
     pub data: Bytes,
+}
+
+impl Message {
+    fn parse_redis_reply(reply: StreamReadReply) -> impl Iterator<Item = Result<Self, Error>> {
+        reply
+            .keys
+            .into_iter()
+            .flat_map(|key| key.ids.into_iter().map(move |data| Message::try_from(data)))
+    }
 }
 
 impl Eq for Message {}
 
 impl PartialEq for Message {
     fn eq(&self, other: &Self) -> bool {
-        self.stream_msg_id == other.stream_msg_id
+        self.id == other.id
     }
 }
 
@@ -247,10 +311,23 @@ impl TryFrom<StreamId> for Message {
             .ok_or_else(|| Error::MissingField { field: "data" })?;
         let stream_msg_id = value.id;
         Ok(Self {
-            stream_msg_id: stream_msg_id.into(),
+            id: stream_msg_id.into(),
             sender: Uuid::from_bytes(sender),
             data: Bytes::from(payload),
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub snapshot_threshold: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            snapshot_threshold: 100,
+        }
     }
 }
 
@@ -332,7 +409,7 @@ mod test {
         let conn = redis_client.get_connection_manager().await.unwrap();
         let memory = MemoryConfig::default().into_builder().build().unwrap();
         let operator = OperatorBuilder::new(memory).finish();
-        let group = BroadcastGroup::new("test-stream", conn, operator);
+        let group = BroadcastGroup::new("test-stream", conn, operator, Default::default());
 
         let client1 = uuid::Uuid::new_v4();
         let (client_tx1, server_rx1) = test_subscriber();
@@ -362,6 +439,6 @@ mod test {
         let res = timeout(Duration::from_millis(100), client_rx1.next()).await;
         assert!(res.is_err(), "client shouldn't receive its own message");
 
-        group.cutoff(&msg.stream_msg_id).await.unwrap()
+        group.cutoff(&msg.id).await.unwrap();
     }
 }

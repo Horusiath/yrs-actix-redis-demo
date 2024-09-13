@@ -1,5 +1,6 @@
 pub mod broadcast;
 pub mod error;
+pub mod snapshot;
 
 use actix_web::web::Data;
 use actix_web::{rt, web, App, Error, HttpRequest, HttpResponse, HttpServer};

@@ -1,27 +1,51 @@
 # Essential services for AppFlowy Cloud
 services:
+  # Redis is used to store incremental updates. These updates are
+  # compacted into main document once every 100 and stored to S3.
   redis:
     restart: on-failure
     image: redis
     ports:
       - 6379:6379
 
+  # Minio is an open-source object storage server, that works as a
+  # S3 substitute. It is used to store the main document state.
+  minio:
+    restart: on-failure
+    image: minio/minio
+    environment:
+      - MINIO_BROWSER_REDIRECT_URL=http://localhost/minio
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+
+  # Our main web app configuration. Here we define two replicas
+  # to show the scalability scenario.
   web:
     restart: on-failure
     build:
       context: .
       dockerfile: Dockerfile
-    image: recast:latest
+    image: web-app:latest
     depends_on:
       - redis
     ports:
-      - "8080-8081:8080"
+      - "8080-8081:8080" # map ports 8080 and 8081 from replicas 8080
     environment:
       - RUST_LOG=info
+      # minio/S3 env variables
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_DEFAULT_REGION=eu-west-1
+      - AWS_ENDPOINT_URL=http://minio:9000
     deploy:
       mode: replicated
-      replicas: 2
+      replicas: 2 # number of replicas, adjust ports accordingly
 
+  # Nginx load balancer between web replicas. See nginx.conf for
+  # configuration details.
   nginx:
     restart: on-failure
     image: nginx
