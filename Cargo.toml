@@ -1,5 +1,5 @@
 [package]
-name = "recast"
+name = "yrs-actix-redis-demo"
 version = "0.1.0"
 edition = "2021"
 
@@ -31,3 +31,4 @@ yrs = { version = "0.21.1", features = ["sync"] }
 opendal = { version = "0.49", features = ["services-s3", "services-memory"] }
 dashmap = "6.1.0"
 arc-swap = "1.7"
+rand = "0.8.5"

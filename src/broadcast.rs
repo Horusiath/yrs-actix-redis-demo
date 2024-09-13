@@ -1,17 +1,16 @@
 use crate::error::Error;
+use crate::snapshot::Snapshotter;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use opendal::Operator;
 use redis::aio::ConnectionManager;
-use redis::streams::{StreamId, StreamRangeReply, StreamReadReply};
+use redis::streams::{StreamId, StreamReadReply};
 use redis::{AsyncCommands, FromRedisValue};
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio_util::sync::ReusableBoxFuture;
 use uuid::Uuid;
 use yrs::Doc;
 
@@ -27,22 +26,18 @@ impl BroadcastGroup {
     pub fn new<S: Into<Arc<str>>>(
         stream_id: S,
         conn: ConnectionManager,
-        operator: Operator,
-        options: Options,
+        snapshotter: Snapshotter,
     ) -> Self {
         let stream_id = stream_id.into();
         let conn = Mutex::new(conn);
         let state = Arc::new(BroadcastState {
             redis: conn,
-            s3: operator,
+            snapshotter,
             stream_id: stream_id.clone(),
             subscribers: DashMap::new(),
         });
         // we can stop task by dropping the broadcast state
-        tokio::spawn(Self::handle_messages(
-            Arc::downgrade(&state),
-            options.snapshot_threshold,
-        ));
+        tokio::spawn(Self::handle_messages(Arc::downgrade(&state)));
         Self { state }
     }
 
@@ -57,7 +52,7 @@ impl BroadcastGroup {
         self.state.load().await
     }
 
-    /// Drops all messages in the stream before the given message ID.
+    /// Drops all messages in the stream up to the given message ID.
     #[inline]
     pub async fn cutoff(&self, msg_id: &str) -> Result<usize, Error> {
         self.state.cutoff(msg_id).await
@@ -95,16 +90,13 @@ impl BroadcastGroup {
         self.state.subscribers.insert(subscriber_id, subscriber);
     }
 
-    async fn handle_messages(state: Weak<BroadcastState>, snapshot_threshold: usize) {
-        if let Err(err) = Self::handle_messages_internal(state, snapshot_threshold).await {
+    async fn handle_messages(state: Weak<BroadcastState>) {
+        if let Err(err) = Self::handle_messages_internal(state).await {
             tracing::error!("Error while handling messages: {}", err);
         }
     }
 
-    async fn handle_messages_internal(
-        state: Weak<BroadcastState>,
-        snapshot_threshold: usize,
-    ) -> Result<(), Error> {
+    async fn handle_messages_internal(state: Weak<BroadcastState>) -> Result<(), Error> {
         let mut last_id: MessageId = "0".into();
         let read_options = redis::streams::StreamReadOptions::default()
             .count(1000) // up to 1000 messages
@@ -128,11 +120,13 @@ impl BroadcastGroup {
                 .await?;
 
             if !reply.keys.is_empty() {
-                let mut messages = Message::parse_redis_reply(reply);
+                let messages = Message::parse_redis_reply(reply);
+                let mut msg_count = 0;
                 let mut dropped_subscribers = HashSet::new();
                 for result in messages {
                     let msg = result?;
                     last_id = msg.id.clone();
+                    msg_count += 1;
                     for subscriber in state.subscribers.iter() {
                         if subscriber.key() != &msg.sender {
                             let msg_id = msg.id.clone();
@@ -158,6 +152,8 @@ impl BroadcastGroup {
                     tracing::trace!("Topic `{}` dropping subscriber `{}`", state.stream_id, id);
                     state.subscribers.remove(&id);
                 }
+
+                state.snapshotter.notify(msg_count, last_id.clone());
             }
         }
         Ok(())
@@ -166,7 +162,7 @@ impl BroadcastGroup {
 
 struct BroadcastState {
     redis: Mutex<ConnectionManager>,
-    s3: Operator,
+    snapshotter: Snapshotter,
     stream_id: Arc<str>,
     subscribers: DashMap<SubscriberId, Subscriber>,
 }
@@ -192,19 +188,7 @@ impl BroadcastState {
     }
 
     pub async fn cutoff(&self, last_msg_id: &str) -> Result<usize, Error> {
-        let mut conn = self.redis.lock().await;
-        let value = conn
-            .xrange(self.stream_id.as_ref(), "-", last_msg_id)
-            .await?;
-        let value = StreamRangeReply::from_owned_redis_value(value)?;
-        let msg_ids: Vec<_> = value
-            .ids
-            .into_iter()
-            .map(|stream_id| stream_id.id)
-            .collect();
-        let count = msg_ids.len();
-        conn.xdel(self.stream_id.as_ref(), &msg_ids).await?;
-        Ok(count)
+        self.snapshotter.cutoff(last_msg_id).await
     }
 }
 
@@ -213,20 +197,15 @@ impl Debug for BroadcastState {
         f.debug_struct("BroadcastState")
             .field("stream_id", &self.stream_id)
             .field("subscribers", &self.subscribers)
+            .field("snapshotter", &self.snapshotter)
             .finish()
     }
-}
-
-struct SnapshotProgress {
-    threshold: usize,
-    counter: usize,
-    last_msg_id: MessageId,
-    pending: Option<ReusableBoxFuture<'static, Result<Doc, Error>>>,
 }
 
 struct Subscriber {
     id: SubscriberId,
     sink: Weak<Mutex<dyn futures::Sink<Message, Error = Error> + Unpin + Send + Sync + 'static>>,
+    #[allow(dead_code)]
     listener: JoinHandle<()>,
 }
 
@@ -283,7 +262,7 @@ pub struct Message {
 }
 
 impl Message {
-    fn parse_redis_reply(reply: StreamReadReply) -> impl Iterator<Item = Result<Self, Error>> {
+    pub fn parse_redis_reply(reply: StreamReadReply) -> impl Iterator<Item = Result<Self, Error>> {
         reply
             .keys
             .into_iter()
@@ -318,19 +297,6 @@ impl TryFrom<StreamId> for Message {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Options {
-    pub snapshot_threshold: usize,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            snapshot_threshold: 100,
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use bytes::Bytes;
@@ -345,9 +311,11 @@ mod test {
     use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
     use tokio::sync::Mutex;
     use tokio::time::timeout;
+    use uuid::Uuid;
 
     use crate::broadcast::BroadcastGroup;
     use crate::error::Error;
+    use crate::snapshot::Snapshotter;
 
     struct TestSink<T>(UnboundedSender<T>);
 
@@ -401,15 +369,17 @@ mod test {
         (Arc::new(Mutex::new(TestSink(tx))), TestStream(rx))
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test() {
+    #[tokio::test]
+    async fn broadcast_except_self() {
         let _ = env_logger::builder().is_test(true).try_init();
 
+        let stream_id: Arc<str> = Uuid::new_v4().to_string().into();
         let redis_client = Client::open("redis://localhost:6379").unwrap();
         let conn = redis_client.get_connection_manager().await.unwrap();
         let memory = MemoryConfig::default().into_builder().build().unwrap();
         let operator = OperatorBuilder::new(memory).finish();
-        let group = BroadcastGroup::new("test-stream", conn, operator, Default::default());
+        let snapshotter = Snapshotter::new(operator, conn.clone(), stream_id.clone(), 100);
+        let group = BroadcastGroup::new(stream_id, conn, snapshotter);
 
         let client1 = uuid::Uuid::new_v4();
         let (client_tx1, server_rx1) = test_subscriber();
@@ -417,7 +387,7 @@ mod test {
         group.subscribe(client1, Arc::downgrade(&server_tx1), server_rx1);
 
         let client2 = uuid::Uuid::new_v4();
-        let (client_tx2, server_rx2) = test_subscriber();
+        let (_client_tx2, server_rx2) = test_subscriber();
         let (server_tx2, mut client_rx2) = test_subscriber();
         group.subscribe(client2, Arc::downgrade(&server_tx2), server_rx2);
 

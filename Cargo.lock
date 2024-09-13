@@ -1862,39 +1862,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "recast"
-version = "0.1.0"
-dependencies = [
- "actix",
- "actix-http",
- "actix-identity",
- "actix-multipart",
- "actix-router",
- "actix-rt",
- "actix-service",
- "actix-session 0.10.0",
- "actix-web",
- "actix-web-actors",
- "actix-ws",
- "arc-swap",
- "async-trait",
- "bytes",
- "dashmap",
- "env_logger",
- "futures",
- "opendal",
- "redis",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "yrs",
-]
-
-[[package]]
 name = "redis"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2877,6 +2844,40 @@ dependencies = [
  "smallstr",
  "smallvec",
  "thiserror",
+]
+
+[[package]]
+name = "yrs-actix-redis-demo"
+version = "0.1.0"
+dependencies = [
+ "actix",
+ "actix-http",
+ "actix-identity",
+ "actix-multipart",
+ "actix-router",
+ "actix-rt",
+ "actix-service",
+ "actix-session 0.10.0",
+ "actix-web",
+ "actix-web-actors",
+ "actix-ws",
+ "arc-swap",
+ "async-trait",
+ "bytes",
+ "dashmap",
+ "env_logger",
+ "futures",
+ "opendal",
+ "rand",
+ "redis",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "yrs",
 ]
 
 [[package]]

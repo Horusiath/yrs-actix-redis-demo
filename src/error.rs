@@ -8,4 +8,10 @@ pub enum Error {
     SubscriberDropped(SubscriberId),
     #[error("Redis error: {0}")]
     Redis(#[from] redis::RedisError),
+    #[error("Failed to decode Yrs update: {0}")]
+    Serialization(#[from] yrs::encoding::read::Error),
+    #[error("Failed to apply Yrs update: {0}")]
+    Update(#[from] yrs::error::UpdateError),
+    #[error("S3 operation failed: {0}")]
+    S3(#[from] opendal::Error),
 }

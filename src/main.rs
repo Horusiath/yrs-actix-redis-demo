@@ -1,5 +1,6 @@
 pub mod broadcast;
 pub mod error;
+mod lease;
 pub mod snapshot;
 
 use actix_web::web::Data;
