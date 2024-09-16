@@ -2,7 +2,7 @@ use crate::broadcast::{Message, MessageId};
 use crate::error::Error;
 use crate::lease::{Lease, LeaseAcquisition};
 use bytes::Bytes;
-use opendal::Operator;
+use opendal::{ErrorKind, Operator};
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamRangeReply, StreamReadReply};
 use redis::{AsyncCommands, FromRedisValue};
@@ -61,6 +61,11 @@ impl Snapshotter {
     }
 
     #[inline]
+    pub async fn load(&self, up_to: Option<MessageId>) -> Result<LoadedSnapshot, Error> {
+        self.state.load(up_to).await
+    }
+
+    #[inline]
     pub async fn cutoff(&self, last_message_id: &str) -> Result<usize, Error> {
         self.state.cutoff(last_message_id).await
     }
@@ -113,21 +118,22 @@ impl SnapshotterState {
         let snapshot = self.load_snapshot().await?;
         let reply = self.get_updates(up_to).await?;
         let messages = Message::parse_redis_reply(reply);
-        let update = Update::decode_v1(&snapshot)?;
         let doc = Doc::new();
         let mut txn = doc.transact_mut();
-        txn.apply_update(update)?;
-        drop(snapshot); // no longer needed
+        if let Some(snapshot) = snapshot {
+            let update = Update::decode_v1(&snapshot)?;
+            txn.apply_update(update)?;
+        }
         let mut last_message_id = None;
         let mut i = 0;
         for result in messages {
             let msg = result?;
-            let update = Update::decode_v1(&msg.data)?;
+            let update = Update::decode_v1(&msg.update)?;
             txn.apply_update(update)?;
             last_message_id = Some(msg.id);
             i += 1;
         }
-        drop(txn); // commit transaction to compress the document state
+        drop(txn);
         tracing::trace!("Loaded snapshot with {} messages", i);
         Ok(LoadedSnapshot {
             doc,
@@ -156,6 +162,11 @@ impl SnapshotterState {
 
     /// Removes all messages from Redis up to the last message id.
     pub async fn cutoff(&self, last_message_id: &str) -> Result<usize, Error> {
+        tracing::info!(
+            "Pruning Redis stream `{}` up to {}",
+            self.stream_id,
+            last_message_id
+        );
         let mut conn = self.redis.lock().await;
         let value = conn
             .xrange(self.stream_id.as_ref(), "-", last_message_id)
@@ -171,13 +182,17 @@ impl SnapshotterState {
         Ok(count)
     }
 
-    async fn load_snapshot(&self) -> Result<Bytes, Error> {
+    async fn load_snapshot(&self) -> Result<Option<Bytes>, Error> {
         let path = format!("{}/snapshot.y1", self.stream_id);
-        let buf = self.s3.read_with(&path).await?;
-        Ok(buf.current())
+        match self.s3.read_with(&path).await {
+            Ok(buf) => Ok(Some(buf.current())),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn upload_snapshot(&self, doc_state: Bytes, last_message_id: &str) -> Result<(), Error> {
+        //TODO: we could have multiple snapshots
         let path = format!("{}/snapshot.y1", self.stream_id);
         self.s3.write_with(&path, doc_state).await?;
         Ok(())
