@@ -45,7 +45,7 @@ impl Snapshotter {
             .fetch_add(msg_count, std::sync::atomic::Ordering::SeqCst);
 
         if prev + msg_count >= self.state.snapshot_threshold {
-            tracing::trace!("Requesting for snapshot at `{}`", last_message_id);
+            tracing::debug!("Requesting for snapshot at `{}`", last_message_id);
             let state = self.state.clone();
             tokio::spawn(async move {
                 if let Err(err) = state.snapshot(Some(last_message_id.clone())).await {
@@ -66,7 +66,7 @@ impl Snapshotter {
     }
 
     #[inline]
-    pub async fn cutoff(&self, last_message_id: &str) -> Result<usize, Error> {
+    pub async fn cutoff(&self, last_message_id: MessageId) -> Result<usize, Error> {
         self.state.cutoff(last_message_id).await
     }
 }
@@ -87,17 +87,20 @@ impl SnapshotterState {
     /// If the snapshot didn't change since the last one, no new snapshot will be generated.
     /// If another snapshot request is in progress, this method will be no-op.
     pub async fn snapshot(&self, up_to: Option<MessageId>) -> Result<bool, Error> {
-        if let Some(lease_acq) = self.lease().await? {
+        let counter = self.update_ticks.load(std::sync::atomic::Ordering::SeqCst);
+        let result = if let Some(lease_acq) = self.lease().await? {
             tracing::trace!("Acquired lease to snapshot topic `{}`", self.stream_id);
 
-            let counter = self.update_ticks.load(std::sync::atomic::Ordering::SeqCst);
             let snapshot = self.load(up_to).await?;
 
             let has_changed = if let Some(msg_id) = snapshot.last_message_id {
                 // snapshot state changed
-                self.store(snapshot.doc, msg_id).await?;
-                self.update_ticks
-                    .fetch_sub(counter, std::sync::atomic::Ordering::SeqCst);
+                self.store(snapshot.doc, msg_id.clone()).await?;
+                tracing::debug!(
+                    "Snapshotted document `{}` at timestamp {}",
+                    self.stream_id,
+                    msg_id
+                );
                 true
             } else {
                 false
@@ -111,7 +114,10 @@ impl SnapshotterState {
                 self.stream_id
             );
             Ok(false)
-        }
+        };
+        self.update_ticks
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        result
     }
 
     pub async fn load(&self, up_to: Option<MessageId>) -> Result<LoadedSnapshot, Error> {
@@ -134,7 +140,7 @@ impl SnapshotterState {
             i += 1;
         }
         drop(txn);
-        tracing::trace!("Loaded snapshot with {} messages", i);
+        tracing::info!("Loaded snapshot with {} messages", i);
         Ok(LoadedSnapshot {
             doc,
             last_message_id,
@@ -149,27 +155,27 @@ impl SnapshotterState {
 
         tracing::info!("Storing document snapshot at `{}` ({}B)", msg_id, doc.len());
 
-        self.upload_snapshot(doc.clone(), &msg_id).await?;
-        self.cutoff(&msg_id).await?;
+        self.upload_snapshot(doc.clone()).await?;
+        self.cutoff(msg_id).await?;
         Ok(())
     }
 
     async fn get_updates(&self, up_to: Option<MessageId>) -> Result<StreamReadReply, Error> {
         let mut conn = self.redis.lock().await;
-        let last_id = up_to.as_deref().unwrap_or("0");
+        let last_id = up_to.unwrap_or_default().to_string();
         Ok(conn.xread(&[self.stream_id.as_ref()], &[last_id]).await?)
     }
 
     /// Removes all messages from Redis up to the last message id.
-    pub async fn cutoff(&self, last_message_id: &str) -> Result<usize, Error> {
-        tracing::info!(
+    pub async fn cutoff(&self, last_message_id: MessageId) -> Result<usize, Error> {
+        tracing::debug!(
             "Pruning Redis stream `{}` up to {}",
             self.stream_id,
             last_message_id
         );
         let mut conn = self.redis.lock().await;
         let value = conn
-            .xrange(self.stream_id.as_ref(), "-", last_message_id)
+            .xrange(self.stream_id.as_ref(), "-", last_message_id.to_string())
             .await?;
         let value = StreamRangeReply::from_owned_redis_value(value)?;
         let msg_ids: Vec<_> = value
@@ -191,7 +197,7 @@ impl SnapshotterState {
         }
     }
 
-    async fn upload_snapshot(&self, doc_state: Bytes, last_message_id: &str) -> Result<(), Error> {
+    async fn upload_snapshot(&self, doc_state: Bytes) -> Result<(), Error> {
         //TODO: we could have multiple snapshots
         let path = format!("{}/snapshot.y1", self.stream_id);
         self.s3.write_with(&path, doc_state).await?;

@@ -2,6 +2,7 @@ pub mod broadcast;
 pub mod error;
 mod lease;
 pub mod snapshot;
+pub mod test_utils;
 
 use actix_web::web::Data;
 use actix_web::{rt, web, App, Error, HttpRequest, HttpResponse, HttpServer};

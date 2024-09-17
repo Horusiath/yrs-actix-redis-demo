@@ -2866,6 +2866,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "env_logger",
+ "flate2",
  "futures",
  "opendal",
  "rand",

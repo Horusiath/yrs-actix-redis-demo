@@ -18,10 +18,12 @@ end
 
 #[derive(Debug)]
 pub struct LeaseAcquisition {
-    stream_id: Arc<str>,
-    uid: u64,
+    key: String,
+    token: u64,
 }
 
+/// This is Redlock algorithm implementation.
+/// See: https://redis.io/docs/latest/commands/set#patterns
 #[async_trait]
 pub trait Lease {
     /// Attempt to acquire lease on a stream for a given time-to-live.
@@ -44,10 +46,12 @@ impl Lease for ConnectionManager {
         ttl: Duration,
     ) -> Result<Option<LeaseAcquisition>, Error> {
         let ttl = ttl.as_millis() as u64;
-        let uid = random::<u64>();
+        let token = random::<u64>();
+        let key = format!("{}-lease", stream_id);
+        tracing::trace!("acquiring lease {} for {}ms", key, ttl);
         let result: RedisResult<Value> = redis::cmd("SET")
-            .arg(stream_id.as_ref())
-            .arg(uid)
+            .arg(&key)
+            .arg(token)
             .arg("NX")
             .arg("PX")
             .arg(ttl)
@@ -55,8 +59,11 @@ impl Lease for ConnectionManager {
             .await;
 
         match result {
-            Ok(Value::Okay) => Ok(Some(LeaseAcquisition { stream_id, uid })),
-            Ok(_) => Ok(None),
+            Ok(Value::Okay) => Ok(Some(LeaseAcquisition { key, token })),
+            Ok(o) => {
+                tracing::trace!("lease locked: {:?}", o);
+                Ok(None)
+            }
             Err(err) => Err(Error::Redis(err)),
         }
     }
@@ -64,8 +71,8 @@ impl Lease for ConnectionManager {
     async fn release(&mut self, acq: LeaseAcquisition) -> Result<bool, Error> {
         let script = redis::Script::new(RELEASE_SCRIPT);
         let result: i32 = script
-            .key(acq.stream_id.as_ref())
-            .arg(acq.uid)
+            .key(acq.key)
+            .arg(acq.token)
             .invoke_async(self)
             .await?;
         Ok(result == 1)

@@ -1,5 +1,8 @@
 use std::collections::HashSet;
-use std::fmt::{Debug, Formatter};
+use std::fmt::{Debug, Display, Formatter};
+use std::ops::Deref;
+use std::str::FromStr;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
@@ -20,7 +23,43 @@ use crate::error::Error;
 use crate::snapshot::Snapshotter;
 
 pub type SubscriberId = Uuid;
-pub type MessageId = Arc<str>;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
+pub struct MessageId(u64, u64);
+
+impl MessageId {
+    pub fn new(timestamp: u64, seq_no: u64) -> Self {
+        Self(timestamp, seq_no)
+    }
+
+    pub fn try_parse(s: &str) -> Option<Self> {
+        let mut parts = s.split('-');
+        let timestmap: u64 = parts.next()?.parse().ok()?;
+        let seq_no: u64 = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self(timestmap, seq_no))
+    }
+}
+
+impl Display for MessageId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.0, self.1)
+    }
+}
+
+impl FromStr for MessageId {
+    type Err = MessageIdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_parse(s).ok_or(MessageIdParseError)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to parse message id")]
+pub struct MessageIdParseError;
 
 #[derive(Debug, Clone)]
 pub struct BroadcastGroup {
@@ -40,27 +79,12 @@ impl BroadcastGroup {
             snapshotter,
             stream_id: stream_id.clone(),
             subscribers: DashMap::new(),
+            updates_sent: Default::default(),
+            updates_received: Default::default(),
         });
         // we can stop task by dropping the broadcast state
         tokio::spawn(Self::handle_messages(Arc::downgrade(&state)));
         Self { state }
-    }
-
-    #[inline]
-    pub async fn publish(&self, sender: &SubscriberId, msg: Bytes) -> Result<String, Error> {
-        self.state.publish(sender, msg).await
-    }
-
-    /// Loads document state.
-    #[inline]
-    pub async fn load(&self) -> Result<Doc, Error> {
-        self.state.load().await
-    }
-
-    /// Drops all messages in the stream up to the given message ID.
-    #[inline]
-    pub async fn cutoff(&self, msg_id: &str) -> Result<usize, Error> {
-        self.state.cutoff(msg_id).await
     }
 
     /// Accepts a new subscriber.
@@ -106,7 +130,7 @@ impl BroadcastGroup {
 
     /// Handles updates from Redis stream.
     async fn handle_redis_updates(state: Weak<BroadcastState>) -> Result<(), Error> {
-        let mut last_id: MessageId = "0".into();
+        let mut last_id: MessageId = MessageId::default();
         let read_options = redis::streams::StreamReadOptions::default().count(100); // block for 1 second
         let mut conn = if let Some(state) = state.upgrade() {
             state.redis.lock().await.clone()
@@ -118,10 +142,11 @@ impl BroadcastGroup {
                 Some(state) => state,
                 None => break,
             };
+            let last_id_str = last_id.to_string();
             let reply: StreamReadReply = conn
                 .xread_options(
                     &[state.stream_id.as_ref()],
-                    &[last_id.as_ref()],
+                    &[last_id_str.as_str()],
                     &read_options,
                 )
                 .await?;
@@ -134,6 +159,9 @@ impl BroadcastGroup {
                     let msg = result?;
                     last_id = msg.id.clone();
                     msg_count += 1;
+                    state
+                        .updates_received
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     for subscriber in state.subscribers.iter() {
                         if subscriber.key() != &msg.sender {
                             let msg_id = msg.id.clone();
@@ -167,14 +195,24 @@ impl BroadcastGroup {
     }
 }
 
-struct BroadcastState {
+pub struct BroadcastState {
     redis: Mutex<ConnectionManager>,
     snapshotter: Snapshotter,
     stream_id: Arc<str>,
     subscribers: DashMap<SubscriberId, Subscriber>,
+    updates_sent: AtomicU64,
+    updates_received: AtomicU64,
 }
 
 impl BroadcastState {
+    pub fn updates_sent(&self) -> u64 {
+        self.updates_sent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn updates_received(&self) -> u64 {
+        self.updates_received
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub async fn load(&self) -> Result<Doc, Error> {
         let loaded = self.snapshotter.load(None).await?;
         Ok(loaded.doc)
@@ -195,8 +233,16 @@ impl BroadcastState {
         Ok(String::from_owned_redis_value(message_id)?)
     }
 
-    pub async fn cutoff(&self, last_msg_id: &str) -> Result<usize, Error> {
+    pub async fn cutoff(&self, last_msg_id: MessageId) -> Result<usize, Error> {
         self.snapshotter.cutoff(last_msg_id).await
+    }
+}
+
+impl Deref for BroadcastGroup {
+    type Target = BroadcastState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
     }
 }
 
@@ -296,6 +342,9 @@ impl Subscriber {
                                 &[("sender", sender), ("data", update.as_ref())],
                             )
                             .await?;
+                            state
+                                .updates_sent
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                         YMessage::Sync(SyncMessage::Update(update)) => {
                             conn.xadd(
@@ -304,6 +353,9 @@ impl Subscriber {
                                 &[("sender", sender), ("data", update.as_ref())],
                             )
                             .await?;
+                            state
+                                .updates_sent
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                         YMessage::Auth(deny_reason) => {}
                         YMessage::AwarenessQuery => {}
@@ -359,9 +411,9 @@ impl TryFrom<StreamId> for Message {
         let payload = value
             .get::<Bytes>("data")
             .ok_or_else(|| Error::MissingField { field: "data" })?;
-        let stream_msg_id = value.id;
+        let id = MessageId::from_str(&value.id).map_err(|_| Error::MissingField { field: "id" })?;
         Ok(Self {
-            id: stream_msg_id.into(),
+            id,
             sender: Uuid::from_bytes(sender),
             update: Bytes::from(payload),
         })
@@ -369,197 +421,4 @@ impl TryFrom<StreamId> for Message {
 }
 
 #[cfg(test)]
-mod test {
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll};
-    use std::time::Duration;
-
-    use bytes::Bytes;
-    use futures::{SinkExt, StreamExt};
-    use opendal::services::MemoryConfig;
-    use opendal::{Builder, Configurator, OperatorBuilder};
-    use redis::{Client, Commands};
-    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-    use tokio::sync::Mutex;
-    use uuid::Uuid;
-    use yrs::sync::{
-        Awareness, DefaultProtocol, Message as YMessage, MessageReader, Protocol, SyncMessage,
-    };
-    use yrs::updates::decoder::{Decode, DecoderV1};
-    use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-    use yrs::{Doc, GetString, Origin, Text, TextRef, Transact, Update};
-
-    use crate::broadcast::BroadcastGroup;
-    use crate::error::Error;
-    use crate::snapshot::Snapshotter;
-
-    struct TestPeer {
-        awareness: Arc<Awareness>,
-        text: TextRef,
-        subscriber_id: Uuid,
-        inbound_tx: Arc<Mutex<TestSink>>,
-        outbound_rx: Option<TestStream>,
-        outbound_tx: UnboundedSender<Bytes>,
-    }
-
-    impl TestPeer {
-        pub fn new() -> Self {
-            let subscriber_id = Uuid::new_v4();
-            let doc = Doc::new();
-            let text = doc.get_or_insert_text("text");
-            let (inbound_tx, mut inbound_rx) = unbounded_channel::<Bytes>();
-            let (outbound_tx, outbound_rx) = unbounded_channel::<Bytes>();
-            {
-                let sink = outbound_tx.clone();
-                let origin: Origin = doc.client_id().into();
-                doc.observe_update_v1_with("test-send", move |txn, e| {
-                    if txn.origin() != Some(&origin) {
-                        return; // we only send our own updates
-                    }
-                    tracing::trace!(
-                        "TestPeer `{}` sending update: {:#?}",
-                        subscriber_id,
-                        Update::decode_v1(&e.update).unwrap()
-                    );
-                    let msg = YMessage::Sync(SyncMessage::Update(e.update.clone()));
-                    let bytes = Bytes::from(msg.encode_v1());
-                    sink.send(bytes).unwrap();
-                })
-                .unwrap();
-            }
-            let awareness = Arc::new(Awareness::new(doc));
-            {
-                let awareness = Arc::downgrade(&awareness);
-                tokio::spawn(async move {
-                    while let Some(msg) = inbound_rx.recv().await {
-                        match awareness.upgrade() {
-                            None => return,
-                            Some(awareness) => {
-                                let mut decoder = DecoderV1::from(msg.as_ref());
-                                let mut reader = MessageReader::new(&mut decoder);
-                                for res in reader {
-                                    let msg = res.unwrap();
-                                    tracing::trace!(
-                                        "TestPeer `{}` received: {:?}",
-                                        subscriber_id,
-                                        msg
-                                    );
-                                    DefaultProtocol.handle_message(&awareness, msg).unwrap();
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            Self {
-                subscriber_id,
-                awareness,
-                text,
-                inbound_tx: Arc::new(Mutex::new(TestSink(inbound_tx))),
-                outbound_tx,
-                outbound_rx: Some(TestStream(outbound_rx)),
-            }
-        }
-
-        pub fn connect(&mut self, broadcast_group: &BroadcastGroup) {
-            let sink = Arc::downgrade(&self.inbound_tx);
-            let stream = self.outbound_rx.take().unwrap();
-            broadcast_group.subscribe(self.subscriber_id, sink, stream);
-
-            // initializing the connection
-            let bytes: Bytes = {
-                let mut encoder = EncoderV1::new();
-                DefaultProtocol
-                    .start(&self.awareness, &mut encoder)
-                    .unwrap();
-                encoder.to_vec().into()
-            };
-            self.outbound_tx.send(bytes).unwrap();
-        }
-    }
-
-    struct TestSink(UnboundedSender<Bytes>);
-
-    impl futures::Sink<Bytes> for TestSink {
-        type Error = Error;
-
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-            self.0
-                .send(item)
-                .map_err(|_| Error::SubscriberDropped(Default::default()))
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    struct TestStream(UnboundedReceiver<Bytes>);
-
-    impl futures::Stream for TestStream {
-        type Item = Result<Bytes, Error>;
-
-        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            match self.0.poll_recv(cx) {
-                Poll::Ready(Some(msg)) => Poll::Ready(Some(Ok(msg))),
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            }
-        }
-    }
-
-    fn test_subscriber<T>() -> (Arc<Mutex<TestSink>>, TestStream) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Arc::new(Mutex::new(TestSink(tx))), TestStream(rx))
-    }
-
-    #[tokio::test]
-    async fn broadcast_except_self() {
-        let _ = env_logger::builder().is_test(true).try_init();
-
-        let stream_id: Arc<str> = format!("test-stream-{}", Uuid::new_v4()).into();
-        let redis_client = Client::open("redis://localhost:6379").unwrap();
-        let conn = redis_client.get_connection_manager().await.unwrap();
-        let memory = MemoryConfig::default().into_builder().build().unwrap();
-        let operator = OperatorBuilder::new(memory).finish();
-        let snapshotter = Snapshotter::new(operator, conn.clone(), stream_id.clone(), 100);
-        let group = BroadcastGroup::new(stream_id, conn, snapshotter);
-
-        let mut p1 = TestPeer::new();
-        let mut p2 = TestPeer::new();
-        p1.connect(&group);
-        p2.connect(&group);
-
-        {
-            let doc = p1.awareness.doc();
-            let mut tx = doc.transact_mut_with(doc.client_id());
-            p1.text.insert(&mut tx, 0, "Hello, World!");
-        }
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        {
-            let doc = p2.awareness.doc();
-            let tx = doc.transact();
-            let str = p2.text.get_string(&tx);
-            assert_eq!(str, "Hello, World!");
-        }
-    }
-}
+mod test {}
