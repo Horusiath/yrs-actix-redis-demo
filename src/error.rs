@@ -1,4 +1,5 @@
 use crate::broadcast::SubscriberId;
+use actix_ws::Closed;
 use yrs::StateVector;
 
 #[derive(Debug, thiserror::Error)]
@@ -17,4 +18,26 @@ pub enum Error {
     S3(#[from] opendal::Error),
     #[error("Missing updates since: {0:?}")]
     MissingUpdate(StateVector),
+    #[error("Web service error: {0}")]
+    Actix(#[from] actix_web::Error),
+    #[error("Web socket error: {0}")]
+    WsProtocol(#[from] actix_ws::ProtocolError),
+    #[error("Yrs sync protocol error: {0}")]
+    SyncProtocol(#[from] yrs::sync::Error),
+    #[error("Connection closed")]
+    ConnectionClosed,
+    #[error("{0}")]
+    Other(Box<dyn std::error::Error>),
+}
+
+impl From<Closed> for Error {
+    fn from(_: Closed) -> Self {
+        Self::ConnectionClosed
+    }
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for Error {
+    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::Other(Box::new(error))
+    }
 }

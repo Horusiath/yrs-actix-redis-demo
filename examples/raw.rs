@@ -1,11 +1,10 @@
 use opendal::services::MemoryConfig;
-use opendal::Scheme::Memory;
 use opendal::{Builder, Configurator, OperatorBuilder};
 use redis::Client;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::Instant;
 use uuid::Uuid;
 use yrs::{GetString, ReadTxn, Transact};
 use yrs_actix_redis_demo::broadcast::BroadcastGroup;
@@ -88,7 +87,7 @@ async fn main() {
         let sv = txn.state_vector();
         sv == expected_sv
     });
-    p3.connect(&group);
+    p3.connect("ws://localhost:8080/doc").await.unwrap();
     barrier.notified().await;
     let elapsed = start.elapsed();
     tracing::info!("doc initialized from scratch - elapsed time: {:?}", elapsed);

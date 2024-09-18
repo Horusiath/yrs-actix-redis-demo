@@ -32,6 +32,8 @@ opendal = { version = "0.49", features = ["services-s3", "services-memory"] }
 dashmap = "6.1.0"
 arc-swap = "1.7"
 rand = "0.8.5"
+smallvec = { version = "1.13.2", features = ["union", "const_generics"] }
 
 # Optional dependencies
 flate2 = "1.0"
+tokio-tungstenite = { version = "0.24.0", features = ["stream"] }

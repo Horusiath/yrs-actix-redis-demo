@@ -4,24 +4,44 @@ mod lease;
 pub mod snapshot;
 pub mod test_utils;
 
+use crate::broadcast::BroadcastGroup;
 use actix_web::web::Data;
-use actix_web::{rt, web, App, Error, HttpRequest, HttpResponse, HttpServer};
-use actix_ws::AggregatedMessage;
-use futures::StreamExt;
-use redis::Client;
+use actix_web::{web, App, Error, HttpRequest, HttpResponse, HttpServer};
+use opendal::{Builder, OperatorBuilder};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
+use uuid::Uuid;
 
 #[actix::main]
 async fn main() -> Result<(), actix_web::Error> {
     const PORT: u16 = 8080;
     env_logger::init();
+
+    let stream_id: Arc<str> = "test-stream".into();
     let redis = redis::Client::open("redis://localhost:6379").unwrap();
+    let conn = redis.get_connection_manager().await.unwrap();
+    let s3 = opendal::services::S3::default()
+        .access_key_id("minioadmin")
+        .secret_access_key("minioadmin")
+        .region("eu-west-1")
+        .endpoint("http://localhost:9000")
+        .bucket("docs")
+        .build()
+        .unwrap();
+    let snapshot_store = OperatorBuilder::new(s3).finish();
+    let snapshotter = snapshot::Snapshotter::new(
+        snapshot_store.clone(),
+        conn.clone(),
+        stream_id.clone(),
+        std::time::Duration::from_secs(15), // snapshot and compact doc state every 15 seconds
+    );
+    let broadcast_group = BroadcastGroup::new(stream_id, conn, snapshotter);
 
     tracing::info!("Starting web server on port {}", PORT);
     HttpServer::new(move || {
         App::new()
-            .app_data(Data::new(redis.clone()))
-            .route("/echo", web::get().to(echo))
+            .app_data(Data::new(broadcast_group.clone()))
+            .route("/doc", web::get().to(handler))
     })
     .bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, PORT)))?
     .run()
@@ -29,43 +49,21 @@ async fn main() -> Result<(), actix_web::Error> {
     Ok(())
 }
 
-async fn echo(
+async fn handler(
     req: HttpRequest,
     stream: web::Payload,
-    redis: Data<Client>,
+    broadcast_group: Data<BroadcastGroup>,
 ) -> Result<HttpResponse, Error> {
-    let (res, mut session, stream) = actix_ws::handle(&req, stream)?;
+    let (res, session, stream) = actix_ws::handle(&req, stream)?;
 
-    let mut stream = stream
+    let stream = stream
         .aggregate_continuations()
-        // aggregate continuation frames up to 1MiB
-        .max_continuation_size(2_usize.pow(20));
+        // aggregate continuation frames up to 50MiB
+        .max_continuation_size(50 * 1024 * 1024);
 
-    // start task but don't wait for it
-    rt::spawn(async move {
-        // receive messages from websocket
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(AggregatedMessage::Text(text)) => {
-                    // echo text message
-                    session.text(text).await.unwrap();
-                }
+    let subscriber_id = Uuid::new_v4(); // create identifier for this connection
 
-                Ok(AggregatedMessage::Binary(bin)) => {
-                    // echo binary message
-                    session.binary(bin).await.unwrap();
-                }
-
-                Ok(AggregatedMessage::Ping(msg)) => {
-                    // respond to PING frame with PONG frame
-                    session.pong(&msg).await.unwrap();
-                }
-
-                _ => {}
-            }
-        }
-    });
-
-    // respond immediately with response connected to WS session
+    let broadcast_group = broadcast_group.into_inner();
+    broadcast_group.subscribe(subscriber_id, session, stream);
     Ok(res)
 }

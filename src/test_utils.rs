@@ -1,28 +1,27 @@
-use crate::broadcast::BroadcastGroup;
 use crate::error::Error;
 use bytes::Bytes;
 use flate2::bufread::GzDecoder;
+use futures::{SinkExt, Stream, StreamExt};
 use serde::Deserialize;
+use smallvec::{smallvec, SmallVec};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::Mutex;
+use tokio_tungstenite::connect_async;
 use uuid::Uuid;
-use yrs::sync::{Awareness, DefaultProtocol, Message, MessageReader, Protocol, SyncMessage};
+use yrs::sync::protocol::AsyncProtocol;
+use yrs::sync::{Awareness, DefaultProtocol, Message, MessageReader, SyncMessage};
 use yrs::updates::decoder::DecoderV1;
-use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{Doc, Origin, Text, TextRef, Transact, TransactionMut, UpdateEvent};
+use yrs::updates::encoder::Encode;
+use yrs::{merge_updates_v1, Doc, Text, TextRef, Transact, TransactionMut, UpdateEvent};
 
 pub struct TestPeer {
     pub awareness: Arc<Awareness>,
     pub text: TextRef,
-    subscriber_id: Uuid,
-    inbound_tx: Arc<Mutex<TestSink>>,
-    outbound_rx: Option<TestStream>,
-    outbound_tx: UnboundedSender<Bytes>,
+    pub subscriber_id: Uuid,
 }
 
 impl TestPeer {
@@ -30,60 +29,45 @@ impl TestPeer {
         let subscriber_id = Uuid::new_v4();
         let doc = Doc::new();
         let text = doc.get_or_insert_text("text");
-        let (inbound_tx, mut inbound_rx) = unbounded_channel::<Bytes>();
-        let (outbound_tx, outbound_rx) = unbounded_channel::<Bytes>();
-        {
-            let sink = outbound_tx.clone();
-            let origin: Origin = doc.client_id().into();
-            doc.observe_update_v1_with("test-send", move |txn, e| {
-                if txn.origin() != Some(&origin) {
-                    return; // we only send our own updates
-                }
-
-                let msg = Message::Sync(SyncMessage::Update(e.update.clone()));
-                let bytes = Bytes::from(msg.encode_v1());
-                sink.send(bytes).unwrap();
-
-                tracing::trace!(
-                    "TestPeer `{}` sending update ({} bytes)",
-                    subscriber_id,
-                    e.update.len()
-                );
-            })
-            .unwrap();
-        }
         let awareness = Arc::new(Awareness::new(doc));
-        {
-            let awareness = Arc::downgrade(&awareness);
-            tokio::spawn(async move {
-                while let Some(msg) = inbound_rx.recv().await {
-                    match awareness.upgrade() {
-                        None => return,
-                        Some(awareness) => {
-                            let mut decoder = DecoderV1::from(msg.as_ref());
-                            let reader = MessageReader::new(&mut decoder);
-                            for res in reader {
-                                let msg = res.unwrap();
-                                tracing::trace!("TestPeer `{}` received: {:?}", subscriber_id, msg);
-                                DefaultProtocol.handle_message(&awareness, msg).unwrap();
-                            }
-                        }
-                    }
-                }
-            });
-        }
         Self {
             subscriber_id,
             awareness,
             text,
-            inbound_tx: Arc::new(Mutex::new(TestSink(inbound_tx))),
-            outbound_tx,
-            outbound_rx: Some(TestStream(outbound_rx)),
         }
     }
 
-    pub fn connect(&mut self, broadcast_group: &BroadcastGroup) {
-        let sink = Arc::downgrade(&self.inbound_tx);
+    pub async fn connect(&mut self, url: &str) -> Result<(), Error> {
+        let (sender, rx) = unbounded_channel();
+        let (ws_stream, _resp) = connect_async(url).await?;
+        let (sink, stream) = ws_stream.split();
+        {
+            let sender = sender.clone();
+            self.awareness
+                .doc()
+                .observe_update_v1_with(format!("send-{}", url), move |_txn, e| {
+                    let msg = Message::Sync(SyncMessage::Update(e.update.clone()));
+                    sender.send(msg).unwrap();
+                })
+                .unwrap();
+        }
+
+        tokio::spawn(async move {
+            if let Err(err) = Self::send_messages(rx, sink).await {
+                tracing::error!("TestPeer send error: {:?}", err);
+            }
+        });
+        let awareness = self.awareness.clone();
+        tokio::spawn(async move {
+            if let Err(err) = Self::receive_messages(stream, sender, awareness).await {
+                tracing::error!("TestPeer receive error: {:?}", err);
+            }
+        });
+
+        Ok(())
+
+        /*
+        let sink = self.inbound_tx.clone();
         let stream = self.outbound_rx.take().unwrap();
         broadcast_group.subscribe(self.subscriber_id, sink, stream);
 
@@ -95,7 +79,101 @@ impl TestPeer {
                 .unwrap();
             encoder.to_vec().into()
         };
-        self.outbound_tx.send(bytes).unwrap();
+        self.outbound_tx.send(bytes).unwrap();*/
+    }
+
+    async fn receive_messages<S, E>(
+        mut stream: S,
+        sender: UnboundedSender<Message>,
+        awareness: Arc<Awareness>,
+    ) -> Result<(), Error>
+    where
+        S: Stream<Item = Result<tokio_tungstenite::tungstenite::Message, E>> + Unpin,
+        Error: From<E>,
+    {
+        if let Some(msg) = stream.next().await {
+            let msg = msg?;
+            match msg {
+                tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                    let mut decoder = DecoderV1::from(bytes.as_ref());
+                    let reader = MessageReader::new(&mut decoder);
+                    for res in reader {
+                        let msg = res?;
+                        tracing::trace!("TestPeer received: {:?}", msg);
+                        if let Some(reply) = DefaultProtocol.handle_message(&awareness, msg).await?
+                        {
+                            sender.send(reply).map_err(|_| Error::ConnectionClosed)?;
+                        };
+                    }
+                }
+                tokio_tungstenite::tungstenite::Message::Close(reason) => {
+                    let reason = reason.map(|r| r.reason.to_string()).unwrap_or_default();
+                    tracing::info!("TestPeer connection closed: {}", reason);
+                    return Ok(());
+                }
+                tokio_tungstenite::tungstenite::Message::Text(_) => {}
+                tokio_tungstenite::tungstenite::Message::Ping(_) => {}
+                tokio_tungstenite::tungstenite::Message::Pong(_) => {}
+                tokio_tungstenite::tungstenite::Message::Frame(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_messages<S, E>(
+        mut rx: UnboundedReceiver<Message>,
+        mut sink: S,
+    ) -> Result<(), Error>
+    where
+        S: futures::Sink<tokio_tungstenite::tungstenite::Message, Error = E> + Unpin,
+        E: Into<Error>,
+    {
+        while let Some(msg) = rx.recv().await {
+            if let Message::Sync(SyncMessage::Update(update)) = msg {
+                // try to eagerly fetch more updates if possible
+                let update = Self::eager_prefetch(&mut rx, update)?;
+                sink.send(tokio_tungstenite::tungstenite::Message::Binary(update))
+                    .await
+                    .map_err(|_| Error::ConnectionClosed)?;
+            } else {
+                let bytes = msg.encode_v1();
+                sink.send(tokio_tungstenite::tungstenite::Message::Binary(bytes))
+                    .await
+                    .map_err(|_| Error::ConnectionClosed)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn eager_prefetch(rx: &mut UnboundedReceiver<Message>, buf: Vec<u8>) -> Result<Vec<u8>, Error> {
+        let mut updates: SmallVec<[Vec<u8>; 1]> = smallvec![buf];
+        let mut other = None;
+        // try to eagerly fetch more updates if they are already in the queue
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                Message::Sync(SyncMessage::Update(update)) => {
+                    // we stack updates together until we reach a non-update message
+                    updates.push(update);
+                }
+                msg => {
+                    // other type of message, we cannot compact updates anymore,
+                    // so we just prepend the update message and then add new one and send them
+                    // all together
+                    other = Some(msg.encode_v1());
+                    break;
+                }
+            }
+        }
+        let compacted = if updates.len() == 1 {
+            std::mem::take(&mut updates[0])
+        } else {
+            merge_updates_v1(updates)? // try to compact updates together
+        };
+        let mut buf = Message::Sync(SyncMessage::Update(compacted)).encode_v1();
+        if let Some(other) = other {
+            buf.extend_from_slice(&other);
+        }
+        Ok(buf)
     }
 
     /// Returns notifier that will complete when given number of updates has been received.
@@ -155,11 +233,6 @@ impl futures::Stream for TestStream {
             Poll::Pending => Poll::Pending,
         }
     }
-}
-
-fn test_subscriber<T>() -> (Arc<Mutex<TestSink>>, TestStream) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    (Arc::new(Mutex::new(TestSink(tx))), TestStream(rx))
 }
 
 /// Load the testing data at the specified file. If the filename ends in .gz, it will be

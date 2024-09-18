@@ -1,6 +1,7 @@
 use crate::broadcast::{Message, MessageId};
 use crate::error::Error;
 use crate::lease::{Lease, LeaseAcquisition};
+use actix_web::rt;
 use bytes::Bytes;
 use opendal::{ErrorKind, Operator};
 use redis::aio::ConnectionManager;
@@ -11,7 +12,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use yrs::encoding::read::{Cursor, Read};
 use yrs::encoding::write::Write;
@@ -79,7 +79,7 @@ impl SnapshotterState {
         });
         {
             let state = Arc::downgrade(&state);
-            tokio::spawn(async move {
+            rt::spawn(async move {
                 let mut interval = tokio::time::interval(snapshot_interval);
                 interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
                 loop {
@@ -251,7 +251,8 @@ impl SnapshotterState {
     }
 
     async fn upload_snapshot(&self, doc_state: Bytes) -> Result<(), Error> {
-        //TODO: we could have multiple snapshots
+        //TODO: we could have multiple snapshots - key format: {stream_id}/snapshot-{msg_id}.y1
+        // in order to keep the latest snapshot first we'd need to revert it eg. `max_msg_id - msg_id`.
         let path = format!("{}/snapshot.y1", self.stream_id);
         self.s3.write_with(&path, doc_state).await?;
         Ok(())
