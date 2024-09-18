@@ -24,41 +24,7 @@ use crate::snapshot::Snapshotter;
 
 pub type SubscriberId = Uuid;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
-pub struct MessageId {
-    pub timestamp: u64,
-    pub seq_no: u64,
-}
-
-impl MessageId {
-    pub fn new(timestamp: u64, seq_no: u64) -> Self {
-        Self { timestamp, seq_no }
-    }
-
-    pub fn try_parse(s: &str) -> Option<Self> {
-        let mut parts = s.split('-');
-        let timestamp: u64 = parts.next()?.parse().ok()?;
-        let seq_no: u64 = parts.next()?.parse().ok()?;
-        if parts.next().is_some() {
-            return None;
-        }
-        Some(Self { timestamp, seq_no })
-    }
-}
-
-impl Display for MessageId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-{}", self.timestamp, self.seq_no)
-    }
-}
-
-impl FromStr for MessageId {
-    type Err = MessageIdParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::try_parse(s).ok_or(MessageIdParseError)
-    }
-}
+pub type MessageId = Arc<str>;
 
 #[derive(Debug, thiserror::Error)]
 #[error("Failed to parse message id")]
@@ -133,7 +99,7 @@ impl BroadcastGroup {
 
     /// Handles updates from Redis stream.
     async fn handle_redis_updates(state: Weak<BroadcastState>) -> Result<(), Error> {
-        let mut last_id: MessageId = MessageId::default();
+        let mut last_id: MessageId = "0".into();
         let read_options = redis::streams::StreamReadOptions::default().count(100); // block for 1 second
         let mut conn = if let Some(state) = state.upgrade() {
             state.redis.lock().await.clone()
@@ -145,11 +111,10 @@ impl BroadcastGroup {
                 Some(state) => state,
                 None => break,
             };
-            let last_id_str = last_id.to_string();
             let reply: StreamReadReply = conn
                 .xread_options(
                     &[state.stream_id.as_ref()],
-                    &[last_id_str.as_str()],
+                    &[last_id.as_ref()],
                     &read_options,
                 )
                 .await?;
@@ -163,6 +128,7 @@ impl BroadcastGroup {
                     tracing::trace!("Received Redis message: {}", msg.id);
                     last_id = msg.id.clone();
                     msg_count += 1;
+                    state.snapshotter.notify_one();
                     state
                         .updates_received
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -191,10 +157,13 @@ impl BroadcastGroup {
                     tracing::trace!("Topic `{}` dropping subscriber `{}`", state.stream_id, id);
                     state.subscribers.remove(&id);
                 }
-
-                state.snapshotter.notify(msg_count, last_id.clone());
             }
         }
+        Ok(())
+    }
+
+    pub async fn graceful_shutdown(self) -> Result<(), Error> {
+        self.snapshotter.snapshot(None).await?;
         Ok(())
     }
 }
@@ -419,9 +388,8 @@ impl TryFrom<StreamId> for Message {
         let payload = value
             .get::<Bytes>("data")
             .ok_or_else(|| Error::MissingField { field: "data" })?;
-        let id = MessageId::from_str(&value.id).map_err(|_| Error::MissingField { field: "id" })?;
         Ok(Self {
-            id,
+            id: value.id.into(),
             sender: Uuid::from_bytes(sender),
             update: Bytes::from(payload),
         })

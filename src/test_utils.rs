@@ -6,10 +6,8 @@ use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::thread::sleep;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -42,15 +40,15 @@ impl TestPeer {
                     return; // we only send our own updates
                 }
 
+                let msg = Message::Sync(SyncMessage::Update(e.update.clone()));
+                let bytes = Bytes::from(msg.encode_v1());
+                sink.send(bytes).unwrap();
+
                 tracing::trace!(
                     "TestPeer `{}` sending update ({} bytes)",
                     subscriber_id,
                     e.update.len()
                 );
-
-                let msg = Message::Sync(SyncMessage::Update(e.update.clone()));
-                let bytes = Bytes::from(msg.encode_v1());
-                sink.send(bytes).unwrap();
             })
             .unwrap();
         }

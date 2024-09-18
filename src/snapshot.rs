@@ -11,6 +11,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use yrs::encoding::read::{Cursor, Read};
 use yrs::encoding::write::Write;
 use yrs::updates::decoder::{Decode, DecoderV1};
@@ -27,34 +29,16 @@ impl Snapshotter {
         s3: Operator,
         conn: ConnectionManager,
         stream_id: Arc<str>,
-        snapshot_threshold: usize,
+        snapshot_interval: Duration,
     ) -> Self {
-        let state = SnapshotterState {
-            redis: Mutex::new(conn),
-            s3,
-            snapshot_threshold,
-            stream_id,
-            update_ticks: Default::default(),
-        };
-        Self {
-            state: Arc::new(state),
-        }
+        let state = SnapshotterState::new(stream_id, conn, s3, snapshot_interval);
+        Self { state }
     }
 
-    pub fn notify(&self, msg_count: usize, last_message_id: MessageId) {
-        let prev = self
-            .state
+    pub fn notify_one(&self) {
+        self.state
             .update_ticks
-            .fetch_add(msg_count, std::sync::atomic::Ordering::SeqCst);
-
-        if prev + msg_count >= self.state.snapshot_threshold {
-            let state = self.state.clone();
-            tokio::spawn(async move {
-                if let Err(err) = state.snapshot(Some(last_message_id.clone())).await {
-                    tracing::warn!("Failed to snapshot at `{}`: {:?}", last_message_id, err);
-                }
-            });
-        }
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[inline]
@@ -76,12 +60,43 @@ impl Snapshotter {
 struct SnapshotterState {
     redis: Mutex<ConnectionManager>,
     s3: Operator,
-    snapshot_threshold: usize,
     update_ticks: AtomicUsize,
     stream_id: Arc<str>,
 }
 
 impl SnapshotterState {
+    fn new(
+        stream_id: Arc<str>,
+        conn: ConnectionManager,
+        s3: Operator,
+        snapshot_interval: Duration,
+    ) -> Arc<Self> {
+        let state = Arc::new(Self {
+            redis: Mutex::new(conn),
+            update_ticks: AtomicUsize::new(0),
+            s3,
+            stream_id,
+        });
+        {
+            let state = Arc::downgrade(&state);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(snapshot_interval);
+                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    match state.upgrade() {
+                        None => break, // state dropped
+                        Some(state) => {
+                            if let Err(err) = state.snapshot(None).await {
+                                tracing::warn!("Failed to snapshot: {:?}", err);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        state
+    }
     /// Requests a snapshot of the document state up to the given message id.
     /// This snapshot will be generated from the previous snapshot method plus all the Redis
     /// updates on top of it.
@@ -89,18 +104,19 @@ impl SnapshotterState {
     /// If the snapshot didn't change since the last one, no new snapshot will be generated.
     /// If another snapshot request is in progress, this method will be no-op.
     pub async fn snapshot(&self, up_to: Option<MessageId>) -> Result<bool, Error> {
-        let counter = self.update_ticks.load(std::sync::atomic::Ordering::SeqCst);
+        let updates = self
+            .update_ticks
+            .swap(0, std::sync::atomic::Ordering::SeqCst);
+        if updates == 0 {
+            tracing::debug!("Ignoring snapshot request - no updates");
+            return Ok(false); // nothing to snapshot
+        }
         let result = if let Some(lease_acq) = self.lease().await? {
             let snapshot = self.load(up_to).await?;
 
             let has_changed = if let Some(msg_id) = snapshot.last_message_id {
                 // snapshot state changed
                 self.store(snapshot.doc, msg_id.clone()).await?;
-                tracing::debug!(
-                    "Snapshotted document `{}` at timestamp {}",
-                    self.stream_id,
-                    msg_id
-                );
                 true
             } else {
                 false
@@ -109,37 +125,26 @@ impl SnapshotterState {
             self.release(lease_acq).await?;
             Ok(has_changed)
         } else {
-            Ok(false)
+            Ok(false) // another process is doing snapshot atm.
         };
-        self.update_ticks
-            .fetch_sub(counter, std::sync::atomic::Ordering::SeqCst);
         result
     }
 
     pub async fn load(&self, up_to: Option<MessageId>) -> Result<LoadedSnapshot, Error> {
         let snapshot = self.load_snapshot().await?;
+        let messages = self.get_updates(up_to).await?;
         let mut snapshot_info = None;
         let doc = Doc::new();
         let mut txn = doc.transact_mut();
         if let Some(snapshot) = snapshot {
             let mut decoder = DecoderV1::new(Cursor::from(&snapshot));
-            let timestamp = decoder.read_u64()?;
-            let seq_no = decoder.read_u64()?;
-            snapshot_info = Some((MessageId { timestamp, seq_no }, snapshot.len()));
+            let msg_id = Arc::from(decoder.read_string()?);
+            snapshot_info = Some((msg_id, snapshot.len()));
             let update = Update::decode(&mut decoder)?;
             txn.apply_update(update)?;
             if txn.store().pending_update().is_some() {
                 return Err(Error::MissingUpdate(txn.state_vector()));
             }
-        }
-        let reply = self.get_updates().await?;
-        let mut messages = Vec::new();
-        for res in Message::parse_redis_reply(reply) {
-            let msg = res?;
-            if Some(msg.id) == up_to {
-                break;
-            }
-            messages.push(msg);
         }
         let mut last_message_id = None;
         let mut i = 0;
@@ -174,8 +179,7 @@ impl SnapshotterState {
     pub async fn store(&self, doc: Doc, msg_id: MessageId) -> Result<(), Error> {
         let txn = doc.transact();
         let mut encoder = EncoderV1::new();
-        encoder.write_u64(msg_id.timestamp);
-        encoder.write_u64(msg_id.seq_no);
+        encoder.write_string(&msg_id);
         txn.encode_state_as_update(&StateVector::default(), &mut encoder);
         let snapshot: Bytes = encoder.to_vec().into();
 
@@ -187,21 +191,41 @@ impl SnapshotterState {
         Ok(())
     }
 
-    async fn get_updates(&self) -> Result<StreamReadReply, Error> {
+    async fn get_updates(&self, up_to: Option<MessageId>) -> Result<Vec<Message>, Error> {
+        const BATCH_SIZE: usize = 1000;
         let mut conn = self.redis.lock().await;
-        let options = StreamReadOptions::default().count(self.snapshot_threshold);
-        Ok(conn
-            .xread_options(&[self.stream_id.as_ref()], &["0"], &options)
-            .await?)
+        let options = StreamReadOptions::default().count(BATCH_SIZE);
+        let mut messages = Vec::new();
+        let mut last_msg_id: Arc<str> = "0".into();
+        loop {
+            let reply: StreamReadReply = conn
+                .xread_options(
+                    &[self.stream_id.as_ref()],
+                    &[last_msg_id.as_ref()],
+                    &options,
+                )
+                .await?;
+            let mut msg_count = 0;
+
+            for res in Message::parse_redis_reply(reply) {
+                let msg = res?;
+                if Some(&msg.id) == up_to.as_ref() {
+                    return Ok(messages);
+                }
+                last_msg_id = msg.id.clone();
+                messages.push(msg);
+                msg_count += 1;
+            }
+
+            if msg_count < BATCH_SIZE {
+                break;
+            }
+        }
+        Ok(messages)
     }
 
     /// Removes all messages from Redis up to the last message id.
     pub async fn cutoff(&self, last_message_id: MessageId) -> Result<usize, Error> {
-        tracing::debug!(
-            "Pruning Redis stream `{}` up to {}",
-            self.stream_id,
-            last_message_id
-        );
         let mut conn = self.redis.lock().await;
         let value = conn
             .xrange(self.stream_id.as_ref(), "-", last_message_id.to_string())
@@ -249,7 +273,6 @@ impl SnapshotterState {
 impl Debug for SnapshotterState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotterState")
-            .field("snapshot_threshold", &self.snapshot_threshold)
             .field("update_ticks", &self.update_ticks)
             .finish()
     }

@@ -30,7 +30,12 @@ async fn main() {
     //    .unwrap();
     let store = MemoryConfig::default().into_builder().build().unwrap();
     let operator = OperatorBuilder::new(store).finish();
-    let snapshotter = Snapshotter::new(operator, conn.clone(), stream_id.clone(), 20_000);
+    let snapshotter = Snapshotter::new(
+        operator,
+        conn.clone(),
+        stream_id.clone(),
+        Duration::from_secs(5),
+    );
     let group = BroadcastGroup::new(stream_id, conn, snapshotter);
 
     let mut p1 = TestPeer::new();
@@ -89,4 +94,6 @@ async fn main() {
     tracing::info!("doc initialized from scratch - elapsed time: {:?}", elapsed);
     let p3_str = p3.text.get_string(&p3.awareness.doc().transact());
     assert_eq!(p1_str, p3_str);
+
+    group.graceful_shutdown().await.unwrap();
 }
