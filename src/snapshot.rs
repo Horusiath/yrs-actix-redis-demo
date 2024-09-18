@@ -4,14 +4,17 @@ use crate::lease::{Lease, LeaseAcquisition};
 use bytes::Bytes;
 use opendal::{ErrorKind, Operator};
 use redis::aio::ConnectionManager;
-use redis::streams::{StreamRangeReply, StreamReadReply};
+use redis::streams::{StreamRangeReply, StreamReadOptions, StreamReadReply};
 use redis::{AsyncCommands, FromRedisValue};
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use yrs::updates::decoder::Decode;
+use yrs::encoding::read::{Cursor, Read};
+use yrs::encoding::write::Write;
+use yrs::updates::decoder::{Decode, DecoderV1};
+use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 
 #[derive(Debug)]
@@ -45,7 +48,6 @@ impl Snapshotter {
             .fetch_add(msg_count, std::sync::atomic::Ordering::SeqCst);
 
         if prev + msg_count >= self.state.snapshot_threshold {
-            tracing::debug!("Requesting for snapshot at `{}`", last_message_id);
             let state = self.state.clone();
             tokio::spawn(async move {
                 if let Err(err) = state.snapshot(Some(last_message_id.clone())).await {
@@ -89,8 +91,6 @@ impl SnapshotterState {
     pub async fn snapshot(&self, up_to: Option<MessageId>) -> Result<bool, Error> {
         let counter = self.update_ticks.load(std::sync::atomic::Ordering::SeqCst);
         let result = if let Some(lease_acq) = self.lease().await? {
-            tracing::trace!("Acquired lease to snapshot topic `{}`", self.stream_id);
-
             let snapshot = self.load(up_to).await?;
 
             let has_changed = if let Some(msg_id) = snapshot.last_message_id {
@@ -109,61 +109,90 @@ impl SnapshotterState {
             self.release(lease_acq).await?;
             Ok(has_changed)
         } else {
-            tracing::debug!(
-                "Failed to obtain lease to snapshot topic `{}`",
-                self.stream_id
-            );
             Ok(false)
         };
         self.update_ticks
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+            .fetch_sub(counter, std::sync::atomic::Ordering::SeqCst);
         result
     }
 
     pub async fn load(&self, up_to: Option<MessageId>) -> Result<LoadedSnapshot, Error> {
         let snapshot = self.load_snapshot().await?;
-        let reply = self.get_updates(up_to).await?;
-        let messages = Message::parse_redis_reply(reply);
+        let mut snapshot_info = None;
         let doc = Doc::new();
         let mut txn = doc.transact_mut();
         if let Some(snapshot) = snapshot {
-            let update = Update::decode_v1(&snapshot)?;
+            let mut decoder = DecoderV1::new(Cursor::from(&snapshot));
+            let timestamp = decoder.read_u64()?;
+            let seq_no = decoder.read_u64()?;
+            snapshot_info = Some((MessageId { timestamp, seq_no }, snapshot.len()));
+            let update = Update::decode(&mut decoder)?;
             txn.apply_update(update)?;
+            if txn.store().pending_update().is_some() {
+                return Err(Error::MissingUpdate(txn.state_vector()));
+            }
+        }
+        let reply = self.get_updates().await?;
+        let mut messages = Vec::new();
+        for res in Message::parse_redis_reply(reply) {
+            let msg = res?;
+            if Some(msg.id) == up_to {
+                break;
+            }
+            messages.push(msg);
         }
         let mut last_message_id = None;
         let mut i = 0;
-        for result in messages {
-            let msg = result?;
+        for msg in messages {
             let update = Update::decode_v1(&msg.update)?;
             txn.apply_update(update)?;
+            if txn.store().pending_update().is_some() {
+                return Err(Error::MissingUpdate(txn.state_vector()));
+            }
             last_message_id = Some(msg.id);
             i += 1;
         }
         drop(txn);
-        tracing::info!("Loaded snapshot with {} messages", i);
+        let snapshot_id = if let Some((msg_id, size)) = snapshot_info {
+            tracing::info!(
+                "Loaded snapshot from {} ({} bytes) + {} messages",
+                msg_id,
+                size,
+                i
+            );
+            Some(msg_id)
+        } else {
+            None
+        };
         Ok(LoadedSnapshot {
             doc,
+            snapshot_id,
             last_message_id,
         })
     }
 
     pub async fn store(&self, doc: Doc, msg_id: MessageId) -> Result<(), Error> {
         let txn = doc.transact();
-        let doc: Bytes = txn
-            .encode_state_as_update_v1(&StateVector::default())
-            .into();
+        let mut encoder = EncoderV1::new();
+        encoder.write_u64(msg_id.timestamp);
+        encoder.write_u64(msg_id.seq_no);
+        txn.encode_state_as_update(&StateVector::default(), &mut encoder);
+        let snapshot: Bytes = encoder.to_vec().into();
 
-        tracing::info!("Storing document snapshot at `{}` ({}B)", msg_id, doc.len());
+        let len = snapshot.len();
+        tracing::info!("Storing document snapshot at `{}` ({} bytes)", msg_id, len);
 
-        self.upload_snapshot(doc.clone()).await?;
+        self.upload_snapshot(snapshot).await?;
         self.cutoff(msg_id).await?;
         Ok(())
     }
 
-    async fn get_updates(&self, up_to: Option<MessageId>) -> Result<StreamReadReply, Error> {
+    async fn get_updates(&self) -> Result<StreamReadReply, Error> {
         let mut conn = self.redis.lock().await;
-        let last_id = up_to.unwrap_or_default().to_string();
-        Ok(conn.xread(&[self.stream_id.as_ref()], &[last_id]).await?)
+        let options = StreamReadOptions::default().count(self.snapshot_threshold);
+        Ok(conn
+            .xread_options(&[self.stream_id.as_ref()], &["0"], &options)
+            .await?)
     }
 
     /// Removes all messages from Redis up to the last message id.
@@ -229,5 +258,6 @@ impl Debug for SnapshotterState {
 #[derive(Debug)]
 pub struct LoadedSnapshot {
     pub doc: Doc,
+    pub snapshot_id: Option<MessageId>,
     pub last_message_id: Option<MessageId>,
 }

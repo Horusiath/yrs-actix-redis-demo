@@ -42,7 +42,11 @@ impl TestPeer {
                     return; // we only send our own updates
                 }
 
-                tracing::trace!("TestPeer `{}` sending update", subscriber_id,);
+                tracing::trace!(
+                    "TestPeer `{}` sending update ({} bytes)",
+                    subscriber_id,
+                    e.update.len()
+                );
 
                 let msg = Message::Sync(SyncMessage::Update(e.update.clone()));
                 let bytes = Bytes::from(msg.encode_v1());

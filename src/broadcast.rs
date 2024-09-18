@@ -25,27 +25,30 @@ use crate::snapshot::Snapshotter;
 pub type SubscriberId = Uuid;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
-pub struct MessageId(u64, u64);
+pub struct MessageId {
+    pub timestamp: u64,
+    pub seq_no: u64,
+}
 
 impl MessageId {
     pub fn new(timestamp: u64, seq_no: u64) -> Self {
-        Self(timestamp, seq_no)
+        Self { timestamp, seq_no }
     }
 
     pub fn try_parse(s: &str) -> Option<Self> {
         let mut parts = s.split('-');
-        let timestmap: u64 = parts.next()?.parse().ok()?;
+        let timestamp: u64 = parts.next()?.parse().ok()?;
         let seq_no: u64 = parts.next()?.parse().ok()?;
         if parts.next().is_some() {
             return None;
         }
-        Some(Self(timestmap, seq_no))
+        Some(Self { timestamp, seq_no })
     }
 }
 
 impl Display for MessageId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-{}", self.0, self.1)
+        write!(f, "{}-{}", self.timestamp, self.seq_no)
     }
 }
 
@@ -157,6 +160,7 @@ impl BroadcastGroup {
                 let mut dropped_subscribers = HashSet::new();
                 for result in messages {
                     let msg = result?;
+                    tracing::trace!("Received Redis message: {}", msg.id);
                     last_id = msg.id.clone();
                     msg_count += 1;
                     state
@@ -324,7 +328,7 @@ impl Subscriber {
                                         sink.send(reply).await?;
                                     }
                                     tracing::trace!(
-                                        "Send document back to subscriber `{}`",
+                                        "Send update back to subscriber `{}`",
                                         subscriber_id
                                     );
                                     loaded
@@ -336,26 +340,30 @@ impl Subscriber {
                             }
                         }
                         YMessage::Sync(SyncMessage::SyncStep2(update)) => {
-                            conn.xadd(
-                                state.stream_id.as_ref(),
-                                "*",
-                                &[("sender", sender), ("data", update.as_ref())],
-                            )
-                            .await?;
+                            let msg_id: String = conn
+                                .xadd(
+                                    state.stream_id.as_ref(),
+                                    "*",
+                                    &[("sender", sender), ("data", update.as_ref())],
+                                )
+                                .await?;
                             state
                                 .updates_sent
                                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tracing::trace!("send update to redis: {}", msg_id);
                         }
                         YMessage::Sync(SyncMessage::Update(update)) => {
-                            conn.xadd(
-                                state.stream_id.as_ref(),
-                                "*",
-                                &[("sender", sender), ("data", update.as_ref())],
-                            )
-                            .await?;
+                            let msg_id: String = conn
+                                .xadd(
+                                    state.stream_id.as_ref(),
+                                    "*",
+                                    &[("sender", sender), ("data", update.as_ref())],
+                                )
+                                .await?;
                             state
                                 .updates_sent
                                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tracing::trace!("send update to redis: {}", msg_id);
                         }
                         YMessage::Auth(deny_reason) => {}
                         YMessage::AwarenessQuery => {}

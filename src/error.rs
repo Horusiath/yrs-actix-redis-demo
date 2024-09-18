@@ -1,4 +1,5 @@
 use crate::broadcast::SubscriberId;
+use yrs::StateVector;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -14,4 +15,6 @@ pub enum Error {
     Update(#[from] yrs::error::UpdateError),
     #[error("S3 operation failed: {0}")]
     S3(#[from] opendal::Error),
+    #[error("Missing updates since: {0:?}")]
+    MissingUpdate(StateVector),
 }
