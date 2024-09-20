@@ -28,6 +28,15 @@ pub type SubscriberId = Uuid;
 
 pub type MessageId = Arc<str>;
 
+macro_rules! verbose_trace {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "verbose-log")]
+        {
+            tracing::trace!($($arg)*);
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("Failed to parse message id")]
 pub struct MessageIdParseError;
@@ -96,6 +105,7 @@ impl BroadcastGroup {
     }
 
     /// Handles updates from Redis stream.
+    #[allow(unused_variables)]
     async fn handle_redis_updates(state: Weak<BroadcastState>) -> Result<(), Error> {
         let mut last_id: MessageId = "0".into();
         let read_options = redis::streams::StreamReadOptions::default().count(100); // block for 1 second
@@ -122,7 +132,7 @@ impl BroadcastGroup {
                 let mut dropped_subscribers = HashMap::new();
                 for result in messages {
                     let msg = result?;
-                    tracing::trace!("Received Redis message: {}", msg.id);
+                    verbose_trace!("Received Redis message: {}", msg.id);
                     last_id = msg.id.clone();
                     state.snapshotter.notify_one();
                     state
@@ -133,7 +143,7 @@ impl BroadcastGroup {
                             let msg_id = msg.id.clone();
                             match subscriber.send_update(msg.update.to_vec()).await {
                                 Ok(_) => {
-                                    tracing::trace!(
+                                    verbose_trace!(
                                         "Topic `{}` sent message `{}` to subscriber `{}`",
                                         state.stream_id,
                                         msg_id,
@@ -210,23 +220,18 @@ impl BroadcastState {
         self.snapshotter.cutoff(last_msg_id).await
     }
 
+    #[allow(unused_variables)]
     async fn handle_message(
         &self,
         bytes: Bytes,
         subscriber_id: SubscriberId,
         session: &Mutex<Session>,
     ) -> Result<(), Error> {
-        let mut conn = self.redis.lock().await;
         let sender: &[u8] = subscriber_id.as_bytes();
         let mut decoder = DecoderV1::from(bytes.as_ref());
         let reader = MessageReader::new(&mut decoder);
         for res in reader {
             let msg = res?;
-            tracing::trace!(
-                "Handling the subscriber's `{}` message: {:?}",
-                subscriber_id,
-                msg
-            );
             match msg {
                 YMessage::Sync(SyncMessage::SyncStep1(sv)) => {
                     //TODO: add local state vector to check if remote has missing updates
@@ -239,13 +244,14 @@ impl BroadcastState {
                         let mut session = session.lock().await;
                         session.binary(reply).await?;
                     }
-                    tracing::trace!("Send update back to subscriber `{}`", subscriber_id);
+                    verbose_trace!("Send sync-step-2 back to subscriber `{}`", subscriber_id);
 
                     if loaded.last_message_id.is_some() {
                         //TODO: since we already have a newer doc state, we can try to snapshot it
                     }
                 }
                 YMessage::Sync(SyncMessage::SyncStep2(update)) => {
+                    let mut conn = self.redis.lock().await;
                     let msg_id: String = conn
                         .xadd(
                             self.stream_id.as_ref(),
@@ -253,11 +259,16 @@ impl BroadcastState {
                             &[("sender", sender), ("data", update.as_ref())],
                         )
                         .await?;
-                    self.total_updates_sent
+                    let i = self
+                        .total_updates_sent
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    tracing::trace!("send update to redis: {}", msg_id);
+                    verbose_trace!("send update to redis: {}", msg_id);
+                    if i % 1000 == 0 {
+                        tracing::trace!("Sent {} updates to Redis", i);
+                    }
                 }
                 YMessage::Sync(SyncMessage::Update(update)) => {
+                    let mut conn = self.redis.lock().await;
                     let msg_id: String = conn
                         .xadd(
                             self.stream_id.as_ref(),
@@ -265,9 +276,13 @@ impl BroadcastState {
                             &[("sender", sender), ("data", update.as_ref())],
                         )
                         .await?;
-                    self.total_updates_sent
+                    let i = self
+                        .total_updates_sent
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    tracing::trace!("send update to redis: {}", msg_id);
+                    verbose_trace!("send update to redis: {}", msg_id);
+                    if i % 1000 == 0 {
+                        tracing::trace!("Sent {} updates to Redis", i);
+                    }
                 }
                 YMessage::Auth(_deny_reason) => {}
                 YMessage::AwarenessQuery => {}
@@ -325,6 +340,11 @@ impl Subscriber {
                     AggregatedMessage::Text(_) => { /* ignore */ }
                     AggregatedMessage::Binary(bytes) => {
                         if let Some(sink) = sink.upgrade() {
+                            verbose_trace!(
+                                "Sending message to `{}`: {} bytes",
+                                subscriber_id,
+                                bytes.len()
+                            );
                             state.handle_message(bytes, subscriber_id, &sink).await?;
                         }
                     }

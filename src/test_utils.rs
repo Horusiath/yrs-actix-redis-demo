@@ -1,4 +1,5 @@
 use crate::error::Error;
+use async_trait::async_trait;
 use bytes::Bytes;
 use flate2::bufread::GzDecoder;
 use futures::{SinkExt, Stream, StreamExt};
@@ -7,31 +8,35 @@ use smallvec::{smallvec, SmallVec};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::connect_async;
-use uuid::Uuid;
 use yrs::sync::protocol::AsyncProtocol;
-use yrs::sync::{Awareness, DefaultProtocol, Message, MessageReader, SyncMessage};
+use yrs::sync::{Awareness, Message, MessageReader, SyncMessage};
 use yrs::updates::decoder::DecoderV1;
 use yrs::updates::encoder::Encode;
-use yrs::{merge_updates_v1, Doc, Text, TextRef, Transact, TransactionMut, UpdateEvent};
+use yrs::{
+    merge_updates_v1, AsyncTransact, Doc, ReadTxn, Text, TextRef, TransactionMut, Update,
+    UpdateEvent,
+};
 
 pub struct TestPeer {
     pub awareness: Arc<Awareness>,
     pub text: TextRef,
-    pub subscriber_id: Uuid,
+    pub name: Arc<str>,
 }
 
 impl TestPeer {
-    pub fn new() -> Self {
-        let subscriber_id = Uuid::new_v4();
+    pub fn new<S: Into<Arc<str>>>(name: S) -> Self {
+        let name = name.into();
         let doc = Doc::new();
         let text = doc.get_or_insert_text("text");
         let awareness = Arc::new(Awareness::new(doc));
         Self {
-            subscriber_id,
+            name,
             awareness,
             text,
         }
@@ -52,63 +57,53 @@ impl TestPeer {
                 .unwrap();
         }
 
+        let name = self.name.clone();
         tokio::spawn(async move {
             if let Err(err) = Self::send_messages(rx, sink).await {
-                tracing::error!("TestPeer send error: {:?}", err);
+                tracing::error!("Peer `{}` send error: {:?}", name, err);
             }
         });
+        let name = self.name.clone();
         let awareness = self.awareness.clone();
         tokio::spawn(async move {
-            if let Err(err) = Self::receive_messages(stream, sender, awareness).await {
-                tracing::error!("TestPeer receive error: {:?}", err);
+            if let Err(err) = Self::receive_messages(stream, sender, awareness, name.clone()).await
+            {
+                tracing::error!("Peer `{}` receive error: {:?}", name, err);
             }
         });
 
         Ok(())
-
-        /*
-        let sink = self.inbound_tx.clone();
-        let stream = self.outbound_rx.take().unwrap();
-        broadcast_group.subscribe(self.subscriber_id, sink, stream);
-
-        // initializing the connection
-        let bytes: Bytes = {
-            let mut encoder = EncoderV1::new();
-            DefaultProtocol
-                .start(&self.awareness, &mut encoder)
-                .unwrap();
-            encoder.to_vec().into()
-        };
-        self.outbound_tx.send(bytes).unwrap();*/
     }
 
     async fn receive_messages<S, E>(
         mut stream: S,
         sender: UnboundedSender<Message>,
         awareness: Arc<Awareness>,
+        name: Arc<str>,
     ) -> Result<(), Error>
     where
         S: Stream<Item = Result<tokio_tungstenite::tungstenite::Message, E>> + Unpin,
         Error: From<E>,
     {
+        let protocol = RepairProtocol::default();
         if let Some(msg) = stream.next().await {
             let msg = msg?;
+            tracing::trace!("Peer `{}` received message", name);
             match msg {
                 tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
                     let mut decoder = DecoderV1::from(bytes.as_ref());
                     let reader = MessageReader::new(&mut decoder);
                     for res in reader {
                         let msg = res?;
-                        tracing::trace!("TestPeer received: {:?}", msg);
-                        if let Some(reply) = DefaultProtocol.handle_message(&awareness, msg).await?
-                        {
+                        tracing::trace!("Peer `{}` parsed message: {:?}", name, msg);
+                        if let Some(reply) = protocol.handle_message(&awareness, msg).await? {
                             sender.send(reply).map_err(|_| Error::ConnectionClosed)?;
                         };
                     }
                 }
                 tokio_tungstenite::tungstenite::Message::Close(reason) => {
                     let reason = reason.map(|r| r.reason.to_string()).unwrap_or_default();
-                    tracing::info!("TestPeer connection closed: {}", reason);
+                    tracing::info!("Peer `{}` connection closed: {}", name, reason);
                     return Ok(());
                 }
                 tokio_tungstenite::tungstenite::Message::Text(_) => {}
@@ -117,6 +112,7 @@ impl TestPeer {
                 tokio_tungstenite::tungstenite::Message::Frame(_) => {}
             }
         }
+        tracing::debug!("Peer `{}` closed", name);
         Ok(())
     }
 
@@ -141,19 +137,27 @@ impl TestPeer {
                     .await
                     .map_err(|_| Error::ConnectionClosed)?;
             }
+            sink.flush().await.map_err(|_| Error::ConnectionClosed)?;
         }
         Ok(())
     }
 
     fn eager_prefetch(rx: &mut UnboundedReceiver<Message>, buf: Vec<u8>) -> Result<Vec<u8>, Error> {
+        const SIZE_THRESHOLD: usize = 64 * 1024;
+        let mut size_hint = buf.len();
         let mut updates: SmallVec<[Vec<u8>; 1]> = smallvec![buf];
         let mut other = None;
         // try to eagerly fetch more updates if they are already in the queue
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Message::Sync(SyncMessage::Update(update)) => {
+                    size_hint += update.len();
                     // we stack updates together until we reach a non-update message
                     updates.push(update);
+
+                    if size_hint >= SIZE_THRESHOLD {
+                        break; // potential size of the update may be over threshold, stop here and send what we have
+                    }
                 }
                 msg => {
                     // other type of message, we cannot compact updates anymore,
@@ -167,6 +171,7 @@ impl TestPeer {
         let compacted = if updates.len() == 1 {
             std::mem::take(&mut updates[0])
         } else {
+            tracing::debug!("Compacting {} updates ({} bytes)", updates.len(), size_hint);
             merge_updates_v1(updates)? // try to compact updates together
         };
         let mut buf = Message::Sync(SyncMessage::Update(compacted)).encode_v1();
@@ -193,7 +198,54 @@ impl TestPeer {
                 })
                 .unwrap();
         }
+        tracing::trace!("Set up barrier for {}", self.name);
         barrier
+    }
+}
+
+#[derive(Default)]
+pub struct RepairProtocol {
+    repair_in_progress: AtomicBool,
+}
+
+#[async_trait]
+impl AsyncProtocol for RepairProtocol {
+    async fn handle_sync_step2(
+        &self,
+        awareness: &Awareness,
+        update: Update,
+    ) -> Result<Option<Message>, yrs::sync::Error> {
+        let mut txn = awareness.doc().transact_mut().await;
+        txn.apply_update(update)?;
+        let has_missing =
+            txn.store().pending_update().is_some() || txn.store().pending_ds().is_some();
+        if has_missing {
+            let repair_in_progress = self
+                .repair_in_progress
+                .swap(true, std::sync::atomic::Ordering::SeqCst);
+            if repair_in_progress {
+                Ok(None)
+            } else {
+                tracing::trace!("Requesting repair");
+                let sv = txn.state_vector();
+                Ok(Some(Message::Sync(SyncMessage::SyncStep1(sv))))
+            }
+        } else {
+            if self
+                .repair_in_progress
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                tracing::trace!("Repaired");
+            }
+            Ok(None)
+        }
+    }
+    async fn handle_update(
+        &self,
+        awareness: &Awareness,
+        update: Update,
+    ) -> Result<Option<Message>, yrs::sync::Error> {
+        self.handle_sync_step2(awareness, update).await
     }
 }
 
@@ -286,15 +338,14 @@ pub struct TestData {
 }
 
 impl TestData {
-    pub fn run(self, doc: &Doc) {
+    pub async fn run(self, doc: &Doc, delay: Option<Duration>) {
         let txt = doc.get_or_insert_text("text");
         let client_id = doc.client_id();
-        let mut i = 0;
-        for t in self.txns {
-            if i % 1000 == 0 {
-                //sleep(std::time::Duration::from_millis(15));
+        for t in self.txns.into_iter().take(1) {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
             }
-            let mut txn = doc.transact_mut_with(client_id);
+            let mut txn = doc.transact_mut_with(client_id).await;
             for patch in t.patches {
                 let at = patch.0;
                 let delete = patch.1;
@@ -307,7 +358,6 @@ impl TestData {
                     txt.insert(&mut txn, at as u32, &content);
                 }
             }
-            i += 1;
         }
     }
 }

@@ -1,5 +1,6 @@
 use crate::broadcast::{Message, MessageId};
 use crate::error::Error;
+use crate::error::MissingUpdate;
 use crate::lease::{Lease, LeaseAcquisition};
 use actix_web::rt;
 use bytes::Bytes;
@@ -108,7 +109,6 @@ impl SnapshotterState {
             .update_ticks
             .swap(0, std::sync::atomic::Ordering::SeqCst);
         if updates == 0 {
-            tracing::debug!("Ignoring snapshot request - no updates");
             return Ok(false); // nothing to snapshot
         }
         let result = if let Some(lease_acq) = self.lease().await? {
@@ -138,12 +138,13 @@ impl SnapshotterState {
         let mut txn = doc.transact_mut();
         if let Some(snapshot) = snapshot {
             let mut decoder = DecoderV1::new(Cursor::from(&snapshot));
-            let msg_id = Arc::from(decoder.read_string()?);
-            snapshot_info = Some((msg_id, snapshot.len()));
+            let msg_id: Arc<str> = decoder.read_string()?.into();
+            snapshot_info = Some((msg_id.clone(), snapshot.len()));
             let update = Update::decode(&mut decoder)?;
             txn.apply_update(update)?;
             if txn.store().pending_update().is_some() {
-                return Err(Error::MissingUpdate(txn.state_vector()));
+                let missing = MissingUpdate::new(txn.state_vector(), Some(msg_id));
+                return Err(Error::MissingUpdate(missing.into()));
             }
         }
         let mut last_message_id = None;
@@ -152,7 +153,8 @@ impl SnapshotterState {
             let update = Update::decode_v1(&msg.update)?;
             txn.apply_update(update)?;
             if txn.store().pending_update().is_some() {
-                return Err(Error::MissingUpdate(txn.state_vector()));
+                let missing = MissingUpdate::new(txn.state_vector(), Some(msg.id));
+                return Err(Error::MissingUpdate(missing.into()));
             }
             last_message_id = Some(msg.id);
             i += 1;
@@ -238,6 +240,11 @@ impl SnapshotterState {
             .collect();
         let count = msg_ids.len();
         conn.xdel(self.stream_id.as_ref(), &msg_ids).await?;
+        tracing::debug!(
+            "Pruned redis stream <= `{}` ({} objects)",
+            last_message_id,
+            count
+        );
         Ok(count)
     }
 

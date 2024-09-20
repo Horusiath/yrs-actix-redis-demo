@@ -12,6 +12,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use uuid::Uuid;
 
+const PAYLOAD_SIZE_LIMIT: usize = 2 * 1024 * 1024; // 2MiB
+
 #[actix::main]
 async fn main() -> Result<(), actix_web::Error> {
     const PORT: u16 = 8080;
@@ -41,6 +43,7 @@ async fn main() -> Result<(), actix_web::Error> {
     HttpServer::new(move || {
         App::new()
             .app_data(Data::new(broadcast_group.clone()))
+            .app_data(web::PayloadConfig::new(PAYLOAD_SIZE_LIMIT))
             .route("/doc", web::get().to(handler))
     })
     .bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, PORT)))?
@@ -58,8 +61,8 @@ async fn handler(
 
     let stream = stream
         .aggregate_continuations()
-        // aggregate continuation frames up to 50MiB
-        .max_continuation_size(50 * 1024 * 1024);
+        // aggregate continuation frames up to 2MiB
+        .max_continuation_size(PAYLOAD_SIZE_LIMIT);
 
     let subscriber_id = Uuid::new_v4(); // create identifier for this connection
 

@@ -3,6 +3,9 @@ name = "yrs-actix-redis-demo"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+verbose-log = []
+
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["full"] }
