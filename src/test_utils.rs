@@ -14,14 +14,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::http::Uri;
+use tokio_tungstenite::tungstenite::ClientRequestBuilder;
 use yrs::sync::protocol::AsyncProtocol;
 use yrs::sync::{Awareness, Message, MessageReader, SyncMessage};
 use yrs::updates::decoder::DecoderV1;
-use yrs::updates::encoder::Encode;
-use yrs::{
-    merge_updates_v1, AsyncTransact, Doc, ReadTxn, Text, TextRef, TransactionMut, Update,
-    UpdateEvent,
-};
+use yrs::updates::encoder::{Encode, EncoderV1};
+use yrs::{merge_updates_v1, AsyncTransact, Doc, Origin, ReadTxn, Text, TextRef, Update};
 
 pub struct TestPeer {
     pub awareness: Arc<Awareness>,
@@ -43,16 +42,24 @@ impl TestPeer {
     }
 
     pub async fn connect(&mut self, url: &str) -> Result<(), Error> {
+        let url: Uri = format!("{}?subscriber_id={}", url, self.name)
+            .parse()
+            .unwrap(); //self.awareness.doc().client_id();
+        let request = ClientRequestBuilder::new(url.clone());
         let (sender, rx) = unbounded_channel();
-        let (ws_stream, _resp) = connect_async(url).await?;
+        let (ws_stream, _resp) = connect_async(request).await?;
         let (sink, stream) = ws_stream.split();
         {
             let sender = sender.clone();
+            let myself: Origin = self.awareness.doc().client_id().into();
             self.awareness
                 .doc()
-                .observe_update_v1_with(format!("send-{}", url), move |_txn, e| {
-                    let msg = Message::Sync(SyncMessage::Update(e.update.clone()));
-                    sender.send(msg).unwrap();
+                .observe_update_v1_with(format!("send-{}", url), move |txn, e| {
+                    if txn.origin() == Some(&myself) {
+                        // only send updates that we have originated
+                        let msg = Message::Sync(SyncMessage::Update(e.update.clone()));
+                        sender.send(msg).unwrap();
+                    }
                 })
                 .unwrap();
         }
@@ -60,7 +67,7 @@ impl TestPeer {
         let name = self.name.clone();
         tokio::spawn(async move {
             if let Err(err) = Self::send_messages(rx, sink).await {
-                tracing::error!("Peer `{}` send error: {:?}", name, err);
+                tracing::error!("peer `{}` send error: {:?}", name, err);
             }
         });
         let name = self.name.clone();
@@ -68,7 +75,7 @@ impl TestPeer {
         tokio::spawn(async move {
             if let Err(err) = Self::receive_messages(stream, sender, awareness, name.clone()).await
             {
-                tracing::error!("Peer `{}` receive error: {:?}", name, err);
+                tracing::error!("peer `{}` receive error: {:?}", name, err);
             }
         });
 
@@ -86,16 +93,20 @@ impl TestPeer {
         Error: From<E>,
     {
         let protocol = RepairProtocol::default();
+        let init = protocol.start::<EncoderV1>(&awareness).await?;
+        for msg in init {
+            sender.send(msg).map_err(|_| Error::ConnectionClosed)?;
+        }
         if let Some(msg) = stream.next().await {
             let msg = msg?;
-            tracing::trace!("Peer `{}` received message", name);
+            tracing::trace!("peer `{}` received message", name);
             match msg {
                 tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
                     let mut decoder = DecoderV1::from(bytes.as_ref());
                     let reader = MessageReader::new(&mut decoder);
                     for res in reader {
                         let msg = res?;
-                        tracing::trace!("Peer `{}` parsed message: {:?}", name, msg);
+                        tracing::trace!("peer `{}` parsed message: {:?}", name, msg);
                         if let Some(reply) = protocol.handle_message(&awareness, msg).await? {
                             sender.send(reply).map_err(|_| Error::ConnectionClosed)?;
                         };
@@ -103,7 +114,7 @@ impl TestPeer {
                 }
                 tokio_tungstenite::tungstenite::Message::Close(reason) => {
                     let reason = reason.map(|r| r.reason.to_string()).unwrap_or_default();
-                    tracing::info!("Peer `{}` connection closed: {}", name, reason);
+                    tracing::info!("peer `{}` connection closed: {}", name, reason);
                     return Ok(());
                 }
                 tokio_tungstenite::tungstenite::Message::Text(_) => {}
@@ -112,7 +123,7 @@ impl TestPeer {
                 tokio_tungstenite::tungstenite::Message::Frame(_) => {}
             }
         }
-        tracing::debug!("Peer `{}` closed", name);
+        tracing::debug!("peer `{}` closed", name);
         Ok(())
     }
 
@@ -181,25 +192,27 @@ impl TestPeer {
         Ok(buf)
     }
 
-    /// Returns notifier that will complete when given number of updates has been received.
-    pub fn update_barrier<F>(&self, predicate: F) -> Arc<tokio::sync::Notify>
-    where
-        F: Fn(&TransactionMut, &UpdateEvent) -> bool + Send + Sync + 'static,
-    {
+    /// Waits until current peer state is equal to the other peer state.
+    pub async fn wait_sync(&self, other: &Self) {
+        let len = other.text.len(&other.awareness.doc().transact().await);
         let barrier = Arc::new(tokio::sync::Notify::new());
+        let notified = barrier.notified();
         {
             let barrier = barrier.clone();
+            let txt = self.text.clone();
             self.awareness
                 .doc()
-                .observe_update_v1_with("countdown", move |txn, e| {
-                    if predicate(txn, e) {
+                .observe_update_v1_with("waiter", move |txn, _| {
+                    if txt.len(txn) == len {
                         barrier.notify_waiters();
                     }
                 })
                 .unwrap();
         }
-        tracing::trace!("Set up barrier for {}", self.name);
-        barrier
+        if self.text.len(&self.awareness.doc().transact().await) == len {
+            return;
+        }
+        notified.await
     }
 }
 

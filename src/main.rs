@@ -5,12 +5,12 @@ pub mod snapshot;
 pub mod test_utils;
 
 use crate::broadcast::BroadcastGroup;
-use actix_web::web::Data;
+use actix_web::web::{Data, Query};
 use actix_web::{web, App, Error, HttpRequest, HttpResponse, HttpServer};
 use opendal::{Builder, OperatorBuilder};
+use serde::Deserialize;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use uuid::Uuid;
 
 const PAYLOAD_SIZE_LIMIT: usize = 2 * 1024 * 1024; // 2MiB
 
@@ -56,6 +56,7 @@ async fn handler(
     req: HttpRequest,
     stream: web::Payload,
     broadcast_group: Data<BroadcastGroup>,
+    query: Query<PeerInfo>,
 ) -> Result<HttpResponse, Error> {
     let (res, session, stream) = actix_ws::handle(&req, stream)?;
 
@@ -64,9 +65,14 @@ async fn handler(
         // aggregate continuation frames up to 2MiB
         .max_continuation_size(PAYLOAD_SIZE_LIMIT);
 
-    let subscriber_id = Uuid::new_v4(); // create identifier for this connection
+    let subscriber_id = query.subscriber_id.clone();
 
     let broadcast_group = broadcast_group.into_inner();
     broadcast_group.subscribe(subscriber_id, session, stream);
     Ok(res)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PeerInfo {
+    pub subscriber_id: Arc<str>,
 }

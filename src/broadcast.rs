@@ -15,7 +15,6 @@ use redis::streams::{StreamId, StreamReadReply};
 use redis::AsyncCommands;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use uuid::Uuid;
 use yrs::sync::{Message as YMessage, MessageReader, SyncMessage};
 use yrs::updates::decoder::DecoderV1;
 use yrs::updates::encoder::Encode;
@@ -24,7 +23,7 @@ use yrs::{Doc, ReadTxn, Transact};
 use crate::error::Error;
 use crate::snapshot::Snapshotter;
 
-pub type SubscriberId = Uuid;
+pub type SubscriberId = Arc<str>;
 
 pub type MessageId = Arc<str>;
 
@@ -76,22 +75,23 @@ impl BroadcastGroup {
     ) {
         let session = Arc::new(Mutex::new(session));
         let listener = {
+            let subscriber_id = subscriber_id.clone();
             let sink = Arc::downgrade(&session);
             let state = Arc::downgrade(&self.state);
             rt::spawn(async move {
                 if let Err(err) = Subscriber::handle(state, subscriber_id, sink, stream).await {
-                    tracing::error!("Error handling subscriber messages: {}", err);
+                    tracing::error!("error while handling subscriber messages: {}", err);
                 }
             })
         };
 
         let subscriber = Subscriber {
-            id: subscriber_id,
+            id: subscriber_id.clone(),
             session,
             listener,
         };
         tracing::info!(
-            "Topic `{}` accepted subscriber `{}`",
+            "topic `{}` accepted subscriber `{}`",
             self.state.stream_id,
             subscriber_id
         );
@@ -100,7 +100,7 @@ impl BroadcastGroup {
 
     async fn handle_messages(state: Weak<BroadcastState>) {
         if let Err(err) = Self::handle_redis_updates(state).await {
-            tracing::error!("Error while handling messages: {}", err);
+            tracing::error!("error while handling messages: {}", err);
         }
     }
 
@@ -132,7 +132,11 @@ impl BroadcastGroup {
                 let mut dropped_subscribers = HashMap::new();
                 for result in messages {
                     let msg = result?;
-                    verbose_trace!("Received Redis message: {}", msg.id);
+                    verbose_trace!(
+                        "topic `{}` got message from Redis: {}",
+                        state.stream_id,
+                        msg.id
+                    );
                     last_id = msg.id.clone();
                     state.snapshotter.notify_one();
                     state
@@ -144,7 +148,7 @@ impl BroadcastGroup {
                             match subscriber.send_update(msg.update.to_vec()).await {
                                 Ok(_) => {
                                     verbose_trace!(
-                                        "Topic `{}` sent message `{}` to subscriber `{}`",
+                                        "topic `{}` sent message `{}` to subscriber `{}`",
                                         state.stream_id,
                                         msg_id,
                                         subscriber.key(),
@@ -152,11 +156,12 @@ impl BroadcastGroup {
                                 }
                                 Err(err) => {
                                     tracing::warn!(
-                                        "Failed to sent message to subscriber `{}`: {}",
+                                        "topic `{}` failed to sent message to subscriber `{}`: {}",
+                                        state.stream_id,
                                         subscriber.id,
                                         err
                                     );
-                                    dropped_subscribers.insert(subscriber.id, err);
+                                    dropped_subscribers.insert(subscriber.id.clone(), err);
                                 }
                             }
                         }
@@ -164,7 +169,7 @@ impl BroadcastGroup {
                 }
 
                 for (id, err) in dropped_subscribers {
-                    tracing::trace!("Topic `{}` dropping subscriber `{}`", state.stream_id, id);
+                    tracing::trace!("topic `{}` dropping subscriber `{}`", state.stream_id, id);
                     if let Some((_, subscriber)) = state.subscribers.remove(&id) {
                         if !matches!(err, Error::ConnectionClosed) {
                             // try to gracefully close the session
@@ -224,7 +229,7 @@ impl BroadcastState {
     async fn handle_message(
         &self,
         bytes: Bytes,
-        subscriber_id: SubscriberId,
+        subscriber_id: &SubscriberId,
         session: &Mutex<Session>,
     ) -> Result<(), Error> {
         let sender: &[u8] = subscriber_id.as_bytes();
@@ -232,19 +237,32 @@ impl BroadcastState {
         let reader = MessageReader::new(&mut decoder);
         for res in reader {
             let msg = res?;
+            verbose_trace!(
+                "topic `{}` got message from subscriber `{}`: {:?}",
+                self.stream_id,
+                subscriber_id,
+                msg
+            );
             match msg {
                 YMessage::Sync(SyncMessage::SyncStep1(sv)) => {
                     //TODO: add local state vector to check if remote has missing updates
                     // without any need to load it
                     let loaded = self.snapshotter.load(None).await?;
-                    {
+                    let len = {
                         let txn = loaded.doc.transact();
                         let doc_state = txn.encode_state_as_update_v1(&sv);
+                        let len = doc_state.len();
                         let reply = YMessage::Sync(SyncMessage::SyncStep2(doc_state)).encode_v1();
                         let mut session = session.lock().await;
                         session.binary(reply).await?;
-                    }
-                    verbose_trace!("Send sync-step-2 back to subscriber `{}`", subscriber_id);
+                        len
+                    };
+                    verbose_trace!(
+                        "topic `{}` sent sync-step-2 back to subscriber `{}` ({} bytes)",
+                        self.stream_id,
+                        subscriber_id,
+                        len
+                    );
 
                     if loaded.last_message_id.is_some() {
                         //TODO: since we already have a newer doc state, we can try to snapshot it
@@ -262,10 +280,12 @@ impl BroadcastState {
                     let i = self
                         .total_updates_sent
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    verbose_trace!("send update to redis: {}", msg_id);
-                    if i % 1000 == 0 {
-                        tracing::trace!("Sent {} updates to Redis", i);
-                    }
+                    verbose_trace!(
+                        "topic `{}` sent document state from `{}` to Redis as {}",
+                        self.stream_id,
+                        subscriber_id,
+                        msg_id
+                    );
                 }
                 YMessage::Sync(SyncMessage::Update(update)) => {
                     let mut conn = self.redis.lock().await;
@@ -279,10 +299,12 @@ impl BroadcastState {
                     let i = self
                         .total_updates_sent
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    verbose_trace!("send update to redis: {}", msg_id);
-                    if i % 1000 == 0 {
-                        tracing::trace!("Sent {} updates to Redis", i);
-                    }
+                    verbose_trace!(
+                        "topic `{}` sent update from `{}` to Redis as {}",
+                        self.stream_id,
+                        subscriber_id,
+                        msg_id
+                    );
                 }
                 YMessage::Auth(_deny_reason) => {}
                 YMessage::AwarenessQuery => {}
@@ -340,12 +362,7 @@ impl Subscriber {
                     AggregatedMessage::Text(_) => { /* ignore */ }
                     AggregatedMessage::Binary(bytes) => {
                         if let Some(sink) = sink.upgrade() {
-                            verbose_trace!(
-                                "Sending message to `{}`: {} bytes",
-                                subscriber_id,
-                                bytes.len()
-                            );
-                            state.handle_message(bytes, subscriber_id, &sink).await?;
+                            state.handle_message(bytes, &subscriber_id, &sink).await?;
                         }
                     }
                     AggregatedMessage::Ping(ping) => {
@@ -360,7 +377,7 @@ impl Subscriber {
                     }
                     AggregatedMessage::Close(reason) => {
                         tracing::trace!(
-                            "Subscriber `{}` closed the connection: {:?}",
+                            "subscriber `{}` closed the connection: {:?}",
                             subscriber_id,
                             reason
                         );
@@ -384,7 +401,7 @@ impl Debug for Subscriber {
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id: MessageId,
-    pub sender: Uuid,
+    pub sender: SubscriberId,
     pub update: Bytes,
 }
 
@@ -409,15 +426,16 @@ impl TryFrom<StreamId> for Message {
     type Error = Error;
 
     fn try_from(value: StreamId) -> Result<Self, Self::Error> {
-        let sender = value
-            .get::<[u8; 16]>("sender")
-            .ok_or_else(|| Error::MissingField { field: "sender" })?;
+        let sender: Arc<str> = value
+            .get::<String>("sender")
+            .ok_or_else(|| Error::MissingField { field: "sender" })?
+            .into();
         let payload = value
             .get::<Bytes>("data")
             .ok_or_else(|| Error::MissingField { field: "data" })?;
         Ok(Self {
             id: value.id.into(),
-            sender: Uuid::from_bytes(sender),
+            sender,
             update: Bytes::from(payload),
         })
     }

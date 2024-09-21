@@ -238,8 +238,8 @@ impl SnapshotterState {
             .into_iter()
             .map(|stream_id| stream_id.id)
             .collect();
-        let count = msg_ids.len();
-        conn.xdel(self.stream_id.as_ref(), &msg_ids).await?;
+        let count: usize = conn.xdel(self.stream_id.as_ref(), &msg_ids).await?;
+        drop(conn);
         tracing::debug!(
             "Pruned redis stream <= `{}` ({} objects)",
             last_message_id,
