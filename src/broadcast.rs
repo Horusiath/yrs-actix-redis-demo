@@ -36,10 +36,6 @@ macro_rules! verbose_trace {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("Failed to parse message id")]
-pub struct MessageIdParseError;
-
 #[derive(Debug, Clone)]
 pub struct BroadcastGroup {
     state: Arc<BroadcastState>,

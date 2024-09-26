@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::http::Uri;
 use tokio_tungstenite::tungstenite::ClientRequestBuilder;
@@ -117,10 +118,18 @@ impl TestPeer {
                     tracing::info!("peer `{}` connection closed: {}", name, reason);
                     return Ok(());
                 }
-                tokio_tungstenite::tungstenite::Message::Text(_) => {}
-                tokio_tungstenite::tungstenite::Message::Ping(_) => {}
-                tokio_tungstenite::tungstenite::Message::Pong(_) => {}
-                tokio_tungstenite::tungstenite::Message::Frame(_) => {}
+                tokio_tungstenite::tungstenite::Message::Text(txt) => {
+                    tracing::warn!("peer `{}` received text message: {}", name, txt);
+                }
+                tokio_tungstenite::tungstenite::Message::Ping(ping) => {
+                    tracing::warn!("peer `{}` received ping message: {:?}", name, ping);
+                }
+                tokio_tungstenite::tungstenite::Message::Pong(pong) => {
+                    tracing::warn!("peer `{}` received pong message: {:?}", name, pong);
+                }
+                tokio_tungstenite::tungstenite::Message::Frame(frame) => {
+                    tracing::warn!("peer `{}` received frame message: {:?}", name, frame);
+                }
             }
         }
         tracing::debug!("peer `{}` closed", name);
@@ -195,6 +204,7 @@ impl TestPeer {
     /// Waits until current peer state is equal to the other peer state.
     pub async fn wait_sync(&self, other: &Self) {
         let len = other.text.len(&other.awareness.doc().transact().await);
+        println!("{} sync with {} -> {}", self.name, other.name, len);
         let barrier = Arc::new(tokio::sync::Notify::new());
         let notified = barrier.notified();
         {
@@ -203,6 +213,7 @@ impl TestPeer {
             self.awareness
                 .doc()
                 .observe_update_v1_with("waiter", move |txn, _| {
+                    println!("{} vs expected {}", txt.len(txn), len);
                     if txt.len(txn) == len {
                         barrier.notify_waiters();
                     }
@@ -210,9 +221,15 @@ impl TestPeer {
                 .unwrap();
         }
         if self.text.len(&self.awareness.doc().transact().await) == len {
+            println!("peers are already in sync");
             return;
+        } else {
+            println!(
+                "peer `{}` waiting for sync from `{}`",
+                self.name, other.name
+            );
         }
-        notified.await
+        timeout(Duration::from_secs(60), notified).await.unwrap()
     }
 }
 

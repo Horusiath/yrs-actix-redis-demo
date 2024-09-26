@@ -3,6 +3,7 @@ pub mod error;
 mod lease;
 pub mod snapshot;
 pub mod test_utils;
+pub mod ws;
 
 use crate::broadcast::BroadcastGroup;
 use actix_web::web::{Data, Query};
